@@ -351,6 +351,57 @@ def export_html(filepath):
     webbrowser.open(f"file://{tmp_path}")
 
 
+# * Org-mode export
+
+def make_heading_text(text, max_len=100):
+    """First line of text, truncated, for use as an Org heading."""
+    line = text.split("\n")[0].strip()
+    if len(line) > max_len:
+        line = line[:max_len - 3] + "..."
+    return line
+
+
+def export_org(filepath):
+    """Export a session transcript to Org-mode and open in Emacs/default editor."""
+    messages = parse_transcript(filepath)
+    project_dir = Path(filepath).parent.parent.name
+    project = short_project_name(project_dir)
+    created, modified = get_file_times(filepath)
+
+    lines = [
+        f"#+title: Cursor Session — {project}",
+        f"#+date: [{created.strftime('%Y-%m-%d %a')}]",
+        "#+options: toc:nil num:nil ^:{}",
+        "",
+        f"- *Project:* {project}",
+        f"- *Created:* [{created.strftime('%Y-%m-%d %a %H:%M')}]",
+        f"- *Modified:* [{modified.strftime('%Y-%m-%d %a %H:%M')}]",
+        f"- *Messages:* {len(messages)}",
+        "",
+    ]
+
+    for role, text in messages:
+        text = strip_tags(text)
+        if not text:
+            continue
+        if role == "user":
+            heading = make_heading_text(text)
+            lines.append(f"* {heading}")
+            if text.strip() != heading.rstrip("..."):
+                lines.append("")
+                lines.append(text)
+        else:
+            lines.append(f"** Assistant")
+            lines.append("")
+            lines.append(text)
+        lines.append("")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".org", prefix="cursearch_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    subprocess.Popen(["open", tmp_path])
+
+
 # * FZF integration
 
 def run_fzf(search_lines):
@@ -360,8 +411,6 @@ def run_fzf(search_lines):
     fzf shows only column 2 (the card). Column 1 is hidden but extractable.
     """
     script_path = os.path.abspath(__file__)
-    preview_cmd_normal = f"python3 '{script_path}' --preview {{1}}"
-    preview_cmd_reverse = f"python3 '{script_path}' --preview {{1}} --reverse"
 
     scope_toggle = (
         "`:transform:"
@@ -376,24 +425,25 @@ def run_fzf(search_lines):
 
     order_toggle = (
         "ctrl-o:transform:"
-        f"if [[ $FZF_PREVIEW_LABEL =~ newest ]]; then "
-        f"echo \"change-preview(python3 '{script_path}' --preview {{1}})"
-        "+change-preview-label([ ↓ chronological ])"
-        "+change-preview-window(right:50%:wrap:+99999)\"; "
-        f"else "
+        f"if [[ $FZF_PREVIEW_LABEL =~ chronological ]]; then "
         f"echo \"change-preview(python3 '{script_path}' --preview {{1}} --reverse)"
-        "+change-preview-label([ ↑ newest first ])"
-        "+change-preview-window(right:50%:wrap)\"; "
+        "+change-preview-label([ ↑ newest first ])\"; "
+        f"else "
+        f"echo \"change-preview(python3 '{script_path}' --preview {{1}})"
+        "+change-preview-label([ ↓ chronological ])\"; "
         "fi"
     )
 
-    export_bind = (
-        f"alt-enter:execute-silent(python3 '{script_path}' --export {{1}})"
+    export_html_bind = (
+        f"alt-enter:execute-silent(python3 '{script_path}' --export-html {{1}})"
+    )
+    export_org_bind = (
+        f"ctrl-c:execute-silent(python3 '{script_path}' --export-org {{1}})"
     )
 
     header = (
         f"{DIM}` user/all  ctrl-o order  alt-⏎ html  "
-        f"ctrl-j/k nav  ctrl-y copy  ⏎ select{RESET}"
+        f"ctrl-c org  ctrl-j/k nav  ctrl-y copy  ⏎ select{RESET}"
     )
     input_text = join_lines(search_lines)
 
@@ -406,16 +456,17 @@ def run_fzf(search_lines):
                 "--read0",
                 "--delimiter", "\t",
                 "--with-nth", "2",
-                "--preview", preview_cmd_normal,
-                "--preview-window", "right:50%:wrap:+99999",
-                "--preview-label", "[ ↓ chronological ]",
+                "--preview", f"python3 '{script_path}' --preview {{1}} --reverse",
+                "--preview-window", "right:50%:wrap",
+                "--preview-label", "[ ↑ newest first ]",
                 "--header", header,
                 "--layout", "reverse",
                 "--info", "inline",
                 "--prompt", "cursearch [all]> ",
                 "--bind", scope_toggle,
                 "--bind", order_toggle,
-                "--bind", export_bind,
+                "--bind", export_html_bind,
+                "--bind", export_org_bind,
                 "--bind", "ctrl-j:down,ctrl-k:up",
                 "--bind", "ctrl-y:execute-silent(echo {1} | pbcopy)",
                 "--color", "header:italic:dim",
@@ -453,8 +504,12 @@ def main():
         preview_session(sys.argv[2], reverse=reverse)
         return
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "--export":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--export-html":
         export_html(sys.argv[2])
+        return
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--export-org":
+        export_org(sys.argv[2])
         return
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--lines":
