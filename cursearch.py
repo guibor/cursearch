@@ -471,7 +471,7 @@ def run_fzf(search_lines):
                 "--bind", "start:unbind(j,k,/)",
                 "--bind", "esc:rebind(j,k,/)+disable-search",
                 "--bind", "/:unbind(j,k,/)+enable-search",
-                "--bind", "ctrl-n:down,ctrl-p:up",
+                "--bind", "ctrl-n:down,ctrl-p:up,alt-j:down,alt-k:up",
                 "--bind", "ctrl-y:execute-silent(echo {1} | pbcopy)",
                 "--color", "header:italic:dim",
             ],
