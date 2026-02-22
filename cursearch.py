@@ -402,105 +402,96 @@ def export_org(filepath):
     subprocess.Popen(["open", tmp_path])
 
 
-# * Open session in Cursor
+# * Resume session
 
-def decode_project_path(dirname):
-    """Resolve actual filesystem path from Cursor project dirname.
-
-    Cursor encodes workspace paths by replacing special chars (/ @ . space)
-    with dashes. We reverse this by greedily matching real directory entries
-    against the encoded segments, longest match first.
-    """
-    parts = dirname.split("-")
-    path = "/"
-    i = 0
-    while i < len(parts) and os.path.isdir(path):
-        try:
-            children = {}
-            for c in os.listdir(path):
-                if os.path.isdir(os.path.join(path, c)):
-                    encoded = re.sub(r'[^a-zA-Z0-9]', '-', c)
-                    children[encoded] = c
-        except PermissionError:
-            break
-
-        found = False
-        for j in range(len(parts), i, -1):
-            key = "-".join(parts[i:j])
-            if key in children:
-                path = os.path.join(path, children[key])
-                i = j
-                found = True
-                break
-        if not found:
-            break
-
-    if i < len(parts):
-        path = os.path.join(path, "-".join(parts[i:]))
-    return path
-
-
-def open_in_cursor(filepath):
-    """Open the project workspace in Cursor."""
-    project_dir = Path(filepath).parent.parent.name
-    workspace = decode_project_path(project_dir)
-
-    if not os.path.isdir(workspace):
-        print(f"Could not resolve workspace for: {project_dir}", file=sys.stderr)
-        return
-
-    subprocess.Popen(
-        ["cursor", workspace],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+def resume_session(filepath):
+    """Resume a Cursor CLI agent session. Replaces the current process."""
+    session_id = Path(filepath).stem
+    os.execvp("cursor", ["cursor", "agent", "resume", session_id])
 
 
 # * FZF integration
 
 def run_fzf(search_lines):
-    """Launch fzf with session cards, preview pane, and keybindings.
+    """Launch fzf with two modes: search and browse.
+
+    Search mode: type to filter. Enter confirms search → browse mode.
+    Browse mode: j/k navigate. Enter resumes session. Esc → back to search.
 
     Column layout: 1=filepath  2=card_with_search_text
-    fzf shows only column 2 (the card). Column 1 is hidden but extractable.
+    Mode is tracked via prompt: single '> ' = search, double '>> ' = browse.
     """
-    script_path = os.path.abspath(__file__)
+    sp = os.path.abspath(__file__)
 
-    scope_toggle = (
-        "`:transform:"
-        f"if [[ $FZF_PROMPT =~ all ]]; then "
-        f"echo \"reload(python3 '{script_path}' --lines user)"
-        "+change-prompt(cursearch [user]> )\"; "
-        f"else "
-        f"echo \"reload(python3 '{script_path}' --lines all)"
-        "+change-prompt(cursearch [all]> )\"; "
+    # ** Enter: search→browse, browse→resume
+    enter_bind = (
+        "enter:transform:"
+        f"if [[ \"$FZF_PROMPT\" =~ \\>\\>\\ $ ]]; then "
+        f"echo \"become(python3 '{sp}' --resume {{1}})\"; "
+        "else "
+        "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
+        "echo \"rebind(j,k,/)+disable-search"
+        "+change-prompt(cursearch [$SCOPE]>> )\"; "
         "fi"
     )
 
+    # ** alt-Enter: always resume (shortcut from any mode)
+    alt_enter_bind = f"alt-enter:become(python3 '{sp}' --resume {{1}})"
+
+    # ** Esc: browse→search, search→quit
+    esc_bind = (
+        "esc:transform:"
+        f"if [[ \"$FZF_PROMPT\" =~ \\>\\>\\ $ ]]; then "
+        "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
+        "echo \"unbind(j,k,/)+enable-search"
+        "+change-prompt(cursearch [$SCOPE]> )\"; "
+        "else echo abort; fi"
+    )
+
+    # ** / (browse mode only, unbound in search): back to search
+    slash_bind = (
+        "/:transform:"
+        "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
+        "echo \"unbind(j,k,/)+enable-search"
+        "+change-prompt(cursearch [$SCOPE]> )\""
+    )
+
+    # ** Backtick: toggle scope, preserve mode marker
+    scope_toggle = (
+        "`:transform:"
+        "if [[ \"$FZF_PROMPT\" =~ \\>\\>\\ $ ]]; then SEP=\">> \"; "
+        "else SEP=\"> \"; fi; "
+        f"if [[ \"$FZF_PROMPT\" =~ all ]]; then "
+        f"echo \"reload(python3 '{sp}' --lines user)"
+        "+change-prompt(cursearch [user]$SEP)\"; "
+        f"else "
+        f"echo \"reload(python3 '{sp}' --lines all)"
+        "+change-prompt(cursearch [all]$SEP)\"; "
+        "fi"
+    )
+
+    # ** ctrl-o: toggle preview order
     order_toggle = (
         "ctrl-o:transform:"
         f"if [[ $FZF_PREVIEW_LABEL =~ chronological ]]; then "
-        f"echo \"change-preview(python3 '{script_path}' --preview {{1}} --reverse)"
+        f"echo \"change-preview(python3 '{sp}' --preview {{1}} --reverse)"
         "+change-preview-label([ ↑ newest first ])\"; "
         f"else "
-        f"echo \"change-preview(python3 '{script_path}' --preview {{1}})"
+        f"echo \"change-preview(python3 '{sp}' --preview {{1}})"
         "+change-preview-label([ ↓ chronological ])\"; "
         "fi"
     )
 
-    open_bind = (
-        f"alt-enter:execute-silent(python3 '{script_path}' --open {{1}})+abort"
-    )
     export_html_bind = (
-        f"ctrl-e:execute-silent(python3 '{script_path}' --export-html {{1}})"
+        f"ctrl-e:execute-silent(python3 '{sp}' --export-html {{1}})"
     )
     export_org_bind = (
-        f"ctrl-i:execute-silent(python3 '{script_path}' --export-org {{1}})"
+        f"ctrl-i:execute-silent(python3 '{sp}' --export-org {{1}})"
     )
 
     header = (
-        f"{DIM}⏎|esc browse  / search  alt-⏎ open  "
-        f"` scope  ctrl-o order  ctrl-e html  ctrl-i org  ctrl-y copy{RESET}"
+        f"{DIM}⏎ confirm  esc back  / search  ` scope  "
+        f"ctrl-o order  ctrl-e html  ctrl-i org  ctrl-y copy{RESET}"
     )
     input_text = join_lines(search_lines)
 
@@ -513,23 +504,23 @@ def run_fzf(search_lines):
                 "--read0",
                 "--delimiter", "\t",
                 "--with-nth", "2",
-                "--preview", f"python3 '{script_path}' --preview {{1}} --reverse",
+                "--preview", f"python3 '{sp}' --preview {{1}} --reverse",
                 "--preview-window", "right:50%:wrap",
                 "--preview-label", "[ ↑ newest first ]",
                 "--header", header,
                 "--layout", "reverse",
                 "--info", "inline",
                 "--prompt", "cursearch [all]> ",
+                "--bind", enter_bind,
+                "--bind", alt_enter_bind,
+                "--bind", esc_bind,
                 "--bind", scope_toggle,
                 "--bind", order_toggle,
-                "--bind", open_bind,
                 "--bind", export_html_bind,
                 "--bind", export_org_bind,
                 "--bind", "j:down,k:up",
+                "--bind", slash_bind,
                 "--bind", "start:unbind(j,k,/)",
-                "--bind", "enter:rebind(j,k,/)+disable-search",
-                "--bind", "esc:rebind(j,k,/)+disable-search",
-                "--bind", "/:unbind(j,k,/)+enable-search",
                 "--bind", "ctrl-n:down,ctrl-p:up,alt-j:down,alt-k:up",
                 "--bind", "ctrl-y:execute-silent(echo {1} | pbcopy)",
                 "--color", "header:italic:dim",
@@ -567,8 +558,8 @@ def main():
         preview_session(sys.argv[2], reverse=reverse)
         return
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "--open":
-        open_in_cursor(sys.argv[2])
+    if len(sys.argv) >= 3 and sys.argv[1] == "--resume":
+        resume_session(sys.argv[2])
         return
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--export-html":
