@@ -415,19 +415,20 @@ def resume_session(filepath):
 def run_fzf(search_lines):
     """Launch fzf with two modes: search and browse.
 
-    Search mode: type to filter. Enter confirms search → browse mode.
-    Browse mode: j/k navigate. Enter resumes session. Esc → back to search.
+    Search mode: type to filter. Enter confirms search -> browse mode.
+    Browse mode: j/k navigate. Enter accepts (returns selection). Esc -> search.
 
     Column layout: 1=filepath  2=card_with_search_text
-    Mode is tracked via prompt: single '> ' = search, double '>> ' = browse.
+    Mode is tracked via prompt: '> ' = search, '>> ' = browse.
+    All transforms use POSIX shell (grep) to detect mode from prompt.
     """
     sp = os.path.abspath(__file__)
 
-    # ** Enter: search→browse, browse→resume
+    # ** Enter: search->browse, browse->accept (return selection to Python)
     enter_bind = (
         "enter:transform:"
-        f"if [[ \"$FZF_PROMPT\" =~ \\>\\>\\ $ ]]; then "
-        f"echo \"become(python3 '{sp}' --resume {{1}})\"; "
+        "if echo \"$FZF_PROMPT\" | grep -q '>>'; then "
+        "echo accept; "
         "else "
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
         "echo \"rebind(j,k,/)+disable-search"
@@ -435,13 +436,13 @@ def run_fzf(search_lines):
         "fi"
     )
 
-    # ** alt-Enter: always resume (shortcut from any mode)
-    alt_enter_bind = f"alt-enter:become(python3 '{sp}' --resume {{1}})"
+    # ** alt-Enter: always accept (resume from any mode)
+    alt_enter_bind = "alt-enter:accept"
 
-    # ** Esc: browse→search, search→quit
+    # ** Esc: browse->search, search->quit
     esc_bind = (
         "esc:transform:"
-        f"if [[ \"$FZF_PROMPT\" =~ \\>\\>\\ $ ]]; then "
+        "if echo \"$FZF_PROMPT\" | grep -q '>>'; then "
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
         "echo \"unbind(j,k,/)+enable-search"
         "+change-prompt(cursearch [$SCOPE]> )\"; "
@@ -459,9 +460,9 @@ def run_fzf(search_lines):
     # ** Backtick: toggle scope, preserve mode marker
     scope_toggle = (
         "`:transform:"
-        "if [[ \"$FZF_PROMPT\" =~ \\>\\>\\ $ ]]; then SEP=\">> \"; "
-        "else SEP=\"> \"; fi; "
-        f"if [[ \"$FZF_PROMPT\" =~ all ]]; then "
+        "if echo \"$FZF_PROMPT\" | grep -q '>>'; then SEP='>> '; "
+        "else SEP='> '; fi; "
+        f"if echo \"$FZF_PROMPT\" | grep -q all; then "
         f"echo \"reload(python3 '{sp}' --lines user)"
         "+change-prompt(cursearch [user]$SEP)\"; "
         f"else "
@@ -473,7 +474,7 @@ def run_fzf(search_lines):
     # ** ctrl-o: toggle preview order
     order_toggle = (
         "ctrl-o:transform:"
-        f"if [[ $FZF_PREVIEW_LABEL =~ chronological ]]; then "
+        f"if echo \"$FZF_PREVIEW_LABEL\" | grep -q chronological; then "
         f"echo \"change-preview(python3 '{sp}' --preview {{1}} --reverse)"
         "+change-preview-label([ ↑ newest first ])\"; "
         f"else "
@@ -587,7 +588,7 @@ def main():
 
     selected = run_fzf(lines)
     if selected:
-        print(f"\n{selected}")
+        resume_session(selected)
 
 
 main()
