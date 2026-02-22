@@ -442,8 +442,8 @@ def run_fzf(search_lines):
     )
 
     header = (
-        f"{DIM}` user/all  ctrl-o order  alt-⏎ html  "
-        f"ctrl-i org  ctrl-j/k nav  ctrl-y copy  ⏎ select{RESET}"
+        f"{DIM}esc browse  / search  ` scope  ctrl-o order  "
+        f"alt-⏎ html  ctrl-i org  ctrl-y copy{RESET}"
     )
     input_text = join_lines(search_lines)
 
@@ -467,7 +467,11 @@ def run_fzf(search_lines):
                 "--bind", order_toggle,
                 "--bind", export_html_bind,
                 "--bind", export_org_bind,
-                "--bind", "ctrl-j:down,ctrl-k:up",
+                "--bind", "j:down,k:up",
+                "--bind", "start:unbind(j,k,/)",
+                "--bind", "esc:rebind(j,k,/)+disable-search",
+                "--bind", "/:unbind(j,k,/)+enable-search",
+                "--bind", "ctrl-n:down,ctrl-p:up",
                 "--bind", "ctrl-y:execute-silent(echo {1} | pbcopy)",
                 "--color", "header:italic:dim",
             ],
