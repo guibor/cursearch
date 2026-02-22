@@ -1,0 +1,2 @@
+# cursearch - no external Python dependencies
+# Requires: fzf (brew install fzf)
