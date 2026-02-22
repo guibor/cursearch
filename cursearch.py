@@ -402,6 +402,60 @@ def export_org(filepath):
     subprocess.Popen(["open", tmp_path])
 
 
+# * Open session in Cursor
+
+def decode_project_path(dirname):
+    """Resolve actual filesystem path from Cursor project dirname.
+
+    Cursor encodes workspace paths by replacing special chars (/ @ . space)
+    with dashes. We reverse this by greedily matching real directory entries
+    against the encoded segments, longest match first.
+    """
+    parts = dirname.split("-")
+    path = "/"
+    i = 0
+    while i < len(parts) and os.path.isdir(path):
+        try:
+            children = {}
+            for c in os.listdir(path):
+                if os.path.isdir(os.path.join(path, c)):
+                    encoded = re.sub(r'[^a-zA-Z0-9]', '-', c)
+                    children[encoded] = c
+        except PermissionError:
+            break
+
+        found = False
+        for j in range(len(parts), i, -1):
+            key = "-".join(parts[i:j])
+            if key in children:
+                path = os.path.join(path, children[key])
+                i = j
+                found = True
+                break
+        if not found:
+            break
+
+    if i < len(parts):
+        path = os.path.join(path, "-".join(parts[i:]))
+    return path
+
+
+def open_in_cursor(filepath):
+    """Open the project workspace in Cursor."""
+    project_dir = Path(filepath).parent.parent.name
+    workspace = decode_project_path(project_dir)
+
+    if not os.path.isdir(workspace):
+        print(f"Could not resolve workspace for: {project_dir}", file=sys.stderr)
+        return
+
+    subprocess.Popen(
+        ["cursor", workspace],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 # * FZF integration
 
 def run_fzf(search_lines):
@@ -434,16 +488,19 @@ def run_fzf(search_lines):
         "fi"
     )
 
+    open_bind = (
+        f"alt-enter:execute-silent(python3 '{script_path}' --open {{1}})+abort"
+    )
     export_html_bind = (
-        f"alt-enter:execute-silent(python3 '{script_path}' --export-html {{1}})"
+        f"ctrl-e:execute-silent(python3 '{script_path}' --export-html {{1}})"
     )
     export_org_bind = (
         f"ctrl-i:execute-silent(python3 '{script_path}' --export-org {{1}})"
     )
 
     header = (
-        f"{DIM}esc browse  / search  ` scope  ctrl-o order  "
-        f"alt-⏎ html  ctrl-i org  ctrl-y copy{RESET}"
+        f"{DIM}⏎|esc browse  / search  alt-⏎ open  "
+        f"` scope  ctrl-o order  ctrl-e html  ctrl-i org  ctrl-y copy{RESET}"
     )
     input_text = join_lines(search_lines)
 
@@ -465,10 +522,12 @@ def run_fzf(search_lines):
                 "--prompt", "cursearch [all]> ",
                 "--bind", scope_toggle,
                 "--bind", order_toggle,
+                "--bind", open_bind,
                 "--bind", export_html_bind,
                 "--bind", export_org_bind,
                 "--bind", "j:down,k:up",
                 "--bind", "start:unbind(j,k,/)",
+                "--bind", "enter:rebind(j,k,/)+disable-search",
                 "--bind", "esc:rebind(j,k,/)+disable-search",
                 "--bind", "/:unbind(j,k,/)+enable-search",
                 "--bind", "ctrl-n:down,ctrl-p:up,alt-j:down,alt-k:up",
@@ -506,6 +565,10 @@ def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
         reverse = "--reverse" in sys.argv[3:]
         preview_session(sys.argv[2], reverse=reverse)
+        return
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--open":
+        open_in_cursor(sys.argv[2])
         return
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--export-html":
