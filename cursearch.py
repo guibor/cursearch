@@ -438,12 +438,12 @@ def run_fzf(search_lines):
         f"alt-enter:execute-silent(python3 '{script_path}' --export-html {{1}})"
     )
     export_org_bind = (
-        f"ctrl-c:execute-silent(python3 '{script_path}' --export-org {{1}})"
+        f"ctrl-i:execute-silent(python3 '{script_path}' --export-org {{1}})"
     )
 
     header = (
         f"{DIM}` user/all  ctrl-o order  alt-⏎ html  "
-        f"ctrl-c org  ctrl-j/k nav  ctrl-y copy  ⏎ select{RESET}"
+        f"ctrl-i org  ctrl-j/k nav  ctrl-y copy  ⏎ select{RESET}"
     )
     input_text = join_lines(search_lines)
 
