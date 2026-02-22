@@ -375,11 +375,11 @@ def run_fzf(search_lines):
     )
 
     order_toggle = (
-        ";:transform:"
+        "ctrl-o:transform:"
         f"if [[ $FZF_PREVIEW_LABEL =~ newest ]]; then "
         f"echo \"change-preview(python3 '{script_path}' --preview {{1}})"
         "+change-preview-label([ ↓ chronological ])"
-        "+change-preview-window(right:50%:wrap:+99999/0)\"; "
+        "+change-preview-window(right:50%:wrap:+99999)\"; "
         f"else "
         f"echo \"change-preview(python3 '{script_path}' --preview {{1}} --reverse)"
         "+change-preview-label([ ↑ newest first ])"
@@ -392,7 +392,7 @@ def run_fzf(search_lines):
     )
 
     header = (
-        f"{DIM}` user/all  ;  order  alt-⏎ html  "
+        f"{DIM}` user/all  ctrl-o order  alt-⏎ html  "
         f"ctrl-j/k nav  ctrl-y copy  ⏎ select{RESET}"
     )
     input_text = join_lines(search_lines)
@@ -407,7 +407,7 @@ def run_fzf(search_lines):
                 "--delimiter", "\t",
                 "--with-nth", "2",
                 "--preview", preview_cmd_normal,
-                "--preview-window", "right:50%:wrap:+99999/0",
+                "--preview-window", "right:50%:wrap:+99999",
                 "--preview-label", "[ ↓ chronological ]",
                 "--header", header,
                 "--layout", "reverse",
@@ -432,6 +432,8 @@ def run_fzf(search_lines):
         parts = result.stdout.strip().split("\t")
         if parts:
             return parts[0]
+    elif result.returncode not in (0, 1, 130):
+        print(f"fzf error (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
     return None
 
 
