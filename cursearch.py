@@ -446,11 +446,11 @@ def resume_session(filepath):
     session_id = Path(filepath).stem
     project_dirname = Path(filepath).parent.parent.name
     project_path = decode_project_path(project_dirname)
-    cmd = ["cursor", "agent", f"--resume={session_id}"]
+    cmd = ["agent", f"--resume={session_id}"]
     print(f"[cursearch] cd {project_path}", file=sys.stderr)
     print(f"[cursearch] {' '.join(cmd)}", file=sys.stderr)
     os.chdir(project_path)
-    os.execvp("cursor", cmd)
+    os.execvp("agent", cmd)
 
 
 # * FZF integration
@@ -563,6 +563,7 @@ def run_fzf(search_lines):
                 "--preview-label", "[ ↑ newest first ]",
                 "--header", header,
                 "--layout", "reverse",
+                "--tiebreak", "index",
                 "--info", "inline",
                 "--prompt", "cursearch [all]> ",
                 "--bind", enter_bind,
