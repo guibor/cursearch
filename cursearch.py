@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import webbrowser
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -191,7 +192,7 @@ def make_summary(messages):
     return " | ".join(parts) if parts else "(empty session)"
 
 
-def build_search_lines(sessions, scope="all"):
+def build_search_lines(sessions, scope="all", sort_by="modified"):
     """Build lines for fzf — one per session.
 
     Each line is a single fzf entry with tab-separated fields:
@@ -200,8 +201,13 @@ def build_search_lines(sessions, scope="all"):
     The visible card is ANSI-formatted. The searchable blob is appended
     with extreme dim so fzf can match it but users never see it.
     """
+    if sort_by == "created":
+        ordered_sessions = sorted(sessions, key=lambda s: s["created"], reverse=True)
+    else:
+        ordered_sessions = sorted(sessions, key=lambda s: s["modified"], reverse=True)
+
     lines = []
-    for s in sessions:
+    for s in ordered_sessions:
         messages = parse_transcript(s["filepath"], max_bytes=MAX_READ_BYTES)
 
         if scope == "user":
@@ -441,15 +447,75 @@ def decode_project_path(dirname):
     return result or best[0]
 
 
+ABS_PATH_RE = re.compile(r"/Users/[^\n\"'`<>]+")
+WORKDIR_RE = re.compile(r'working_directory:\s*(?:"([^"\n]+)"|([^\s"\n]+))')
+
+
+def infer_resume_cwd(transcript_path, project_path):
+    """Infer the best resume cwd from absolute paths inside transcript text."""
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read(300_000)
+    except OSError:
+        return project_path
+
+    project_real = os.path.realpath(project_path)
+    candidates = Counter()
+
+    for match in ABS_PATH_RE.findall(raw):
+        p = match.strip().rstrip(".,;:)]}")
+        if "/.cursor/" in p:
+            continue
+        real = os.path.realpath(p)
+        if os.path.isdir(real):
+            dir_path = real
+        elif os.path.isfile(real):
+            dir_path = os.path.dirname(real)
+        else:
+            continue
+        try:
+            if os.path.commonpath([dir_path, project_real]) != project_real:
+                continue
+        except ValueError:
+            continue
+        candidates[dir_path] += 1
+
+    for m in WORKDIR_RE.finditer(raw):
+        wd = (m.group(1) or m.group(2) or "").strip()
+        if not wd:
+            continue
+        if wd.startswith("/"):
+            real = os.path.realpath(wd)
+        else:
+            real = os.path.realpath(os.path.join(project_real, wd))
+        if not os.path.isdir(real):
+            continue
+        try:
+            if os.path.commonpath([real, project_real]) != project_real:
+                continue
+        except ValueError:
+            continue
+        candidates[real] += 2
+
+    if not candidates:
+        return project_path
+
+    # Prefer frequently referenced and deeper paths (more specific cwd).
+    best_dir = max(candidates.items(), key=lambda kv: (kv[1], kv[0].count("/")))[0]
+    return best_dir
+
+
 def resume_session(filepath):
     """Resume a Cursor CLI agent session. Replaces the current process."""
     session_id = Path(filepath).stem
     project_dirname = Path(filepath).parent.parent.name
     project_path = decode_project_path(project_dirname)
-    cmd = ["agent", f"--resume={session_id}"]
-    print(f"[cursearch] cd {project_path}", file=sys.stderr)
+    resume_cwd = infer_resume_cwd(filepath, project_path)
+    cmd = ["agent", f"--resume={session_id}", "--workspace", resume_cwd]
+    print(f"[cursearch] project {project_path}", file=sys.stderr)
+    print(f"[cursearch] cd {resume_cwd}", file=sys.stderr)
     print(f"[cursearch] {' '.join(cmd)}", file=sys.stderr)
-    os.chdir(project_path)
+    os.chdir(resume_cwd)
     os.execvp("agent", cmd)
 
 
@@ -474,8 +540,9 @@ def run_fzf(search_lines):
         "echo accept; "
         "else "
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
+        "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
         "echo \"rebind(j,k,/)+disable-search"
-        "+change-prompt(cursearch [$SCOPE]>> )\"; "
+        "+change-prompt(cursearch [$SCOPE|$SORT]>> )\"; "
         "fi"
     )
 
@@ -487,8 +554,9 @@ def run_fzf(search_lines):
         "esc:transform:"
         "if echo \"$FZF_PROMPT\" | grep -q '>>'; then "
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
+        "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
         "echo \"unbind(j,k,/)+enable-search"
-        "+change-prompt(cursearch [$SCOPE]> )\"; "
+        "+change-prompt(cursearch [$SCOPE|$SORT]> )\"; "
         "else echo abort; fi"
     )
 
@@ -496,8 +564,9 @@ def run_fzf(search_lines):
     slash_bind = (
         "/:transform:"
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
+        "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
         "echo \"unbind(j,k,/)+enable-search"
-        "+change-prompt(cursearch [$SCOPE]> )\""
+        "+change-prompt(cursearch [$SCOPE|$SORT]> )\""
     )
 
     # ** Backtick: toggle scope, preserve mode marker
@@ -505,12 +574,28 @@ def run_fzf(search_lines):
         "`:transform:"
         "if echo \"$FZF_PROMPT\" | grep -q '>>'; then SEP='>> '; "
         "else SEP='> '; fi; "
+        "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
         f"if echo \"$FZF_PROMPT\" | grep -q all; then "
-        f"echo \"reload(python3 '{sp}' --lines user)"
-        "+change-prompt(cursearch [user]$SEP)\"; "
+        f"echo \"reload(python3 '{sp}' --lines user --sort $SORT)"
+        "+change-prompt(cursearch [user|$SORT]$SEP)\"; "
         f"else "
-        f"echo \"reload(python3 '{sp}' --lines all)"
-        "+change-prompt(cursearch [all]$SEP)\"; "
+        f"echo \"reload(python3 '{sp}' --lines all --sort $SORT)"
+        "+change-prompt(cursearch [all|$SORT]$SEP)\"; "
+        "fi"
+    )
+
+    # ** ctrl-y: toggle sort key, preserve scope and browse/search mode
+    sort_toggle = (
+        "ctrl-y:transform:"
+        "if echo \"$FZF_PROMPT\" | grep -q '>>'; then SEP='>> '; "
+        "else SEP='> '; fi; "
+        "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
+        f"if echo \"$FZF_PROMPT\" | grep -q '|mod'; then "
+        f"echo \"reload(python3 '{sp}' --lines $SCOPE --sort cre)"
+        "+change-prompt(cursearch [$SCOPE|cre]$SEP)\"; "
+        "else "
+        f"echo \"reload(python3 '{sp}' --lines $SCOPE --sort mod)"
+        "+change-prompt(cursearch [$SCOPE|mod]$SEP)\"; "
         "fi"
     )
 
@@ -545,7 +630,7 @@ def run_fzf(search_lines):
 
     header = (
         f"{DIM}⏎ confirm  M-⏎ resume  esc back  / search  ` scope  "
-        f"ctrl-o order  M-h html  ctrl-i org  ctrl-y copy{RESET}"
+        f"ctrl-y sort(mod/cre)  ctrl-o preview-order  M-h html  ctrl-i org{RESET}"
     )
     input_text = join_lines(search_lines)
 
@@ -563,13 +648,15 @@ def run_fzf(search_lines):
                 "--preview-label", "[ ↑ newest first ]",
                 "--header", header,
                 "--layout", "reverse",
+                "--no-sort",
                 "--tiebreak", "index",
                 "--info", "inline",
-                "--prompt", "cursearch [all]> ",
+                "--prompt", "cursearch [all|mod]> ",
                 "--bind", enter_bind,
                 "--bind", alt_enter_bind,
                 "--bind", esc_bind,
                 "--bind", scope_toggle,
+                "--bind", sort_toggle,
                 "--bind", order_toggle,
                 "--bind", export_html_bind,
                 "--bind", export_org_bind,
@@ -578,7 +665,6 @@ def run_fzf(search_lines):
                 "--bind", slash_bind,
                 "--bind", "start:unbind(j,k,/)",
                 "--bind", "ctrl-n:down,ctrl-p:up,alt-j:down,alt-k:up",
-                "--bind", "ctrl-y:execute-silent(echo {1} | pbcopy)",
                 "--color", "header:italic:dim",
             ],
             input=input_text,
@@ -600,10 +686,10 @@ def run_fzf(search_lines):
 
 # * Main
 
-def emit_lines(scope):
+def emit_lines(scope, sort_by="modified"):
     """Print fzf lines to stdout (null-delimited) — used by fzf reload."""
     sessions = scan_all_transcripts()
-    lines = build_search_lines(sessions, scope=scope)
+    lines = build_search_lines(sessions, scope=scope, sort_by=sort_by)
     sys.stdout.write(join_lines(lines))
     sys.stdout.flush()
 
@@ -627,7 +713,10 @@ def main():
         return
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--lines":
-        emit_lines(sys.argv[2])
+        sort_by = "modified"
+        if len(sys.argv) >= 5 and sys.argv[3] == "--sort":
+            sort_by = "created" if sys.argv[4] == "cre" else "modified"
+        emit_lines(sys.argv[2], sort_by=sort_by)
         return
 
     print("Scanning Cursor agent transcripts...", file=sys.stderr)
