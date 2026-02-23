@@ -404,10 +404,53 @@ def export_org(filepath):
 
 # * Resume session
 
+def decode_project_path(dirname):
+    """Decode a Cursor project directory name back to a real filesystem path.
+
+    Cursor encodes paths by replacing /, ., _, and spaces with dashes.
+    Uses DFS with filesystem checks to find the correct decoding.
+    """
+    segments = dirname.split("-")
+    if len(segments) <= 1:
+        return "/" + dirname
+    best = ["/"]
+
+    def try_decode(parent, leaf, idx):
+        if idx >= len(segments):
+            full = os.path.join(parent, leaf)
+            if os.path.isdir(full):
+                return full
+            if len(parent) > len(best[0]):
+                best[0] = parent
+            return None
+        seg = segments[idx]
+        full_current = os.path.join(parent, leaf)
+        if os.path.isdir(full_current):
+            if len(full_current) > len(best[0]):
+                best[0] = full_current
+            result = try_decode(full_current, seg, idx + 1)
+            if result:
+                return result
+        for sep in ["-", ".", "_", " "]:
+            result = try_decode(parent, leaf + sep + seg, idx + 1)
+            if result:
+                return result
+        return None
+
+    result = try_decode("/", segments[0], 1)
+    return result or best[0]
+
+
 def resume_session(filepath):
     """Resume a Cursor CLI agent session. Replaces the current process."""
     session_id = Path(filepath).stem
-    os.execvp("cursor", ["cursor", "agent", "resume", session_id])
+    project_dirname = Path(filepath).parent.parent.name
+    project_path = decode_project_path(project_dirname)
+    cmd = ["cursor", "agent", f"--resume={session_id}"]
+    print(f"[cursearch] cd {project_path}", file=sys.stderr)
+    print(f"[cursearch] {' '.join(cmd)}", file=sys.stderr)
+    os.chdir(project_path)
+    os.execvp("cursor", cmd)
 
 
 # * FZF integration
@@ -436,7 +479,7 @@ def run_fzf(search_lines):
         "fi"
     )
 
-    # ** alt-Enter: always accept (resume from any mode)
+    # ** alt-Enter: always accept → resume from any mode
     alt_enter_bind = "alt-enter:accept"
 
     # ** Esc: browse->search, search->quit
@@ -483,16 +526,26 @@ def run_fzf(search_lines):
         "fi"
     )
 
+    # ** focus: force preview refresh on every selection change
+    focus_preview = (
+        "focus:transform:"
+        f"if echo \"$FZF_PREVIEW_LABEL\" | grep -q chronological; then "
+        f"echo \"preview(python3 '{sp}' --preview {{1}})\"; "
+        f"else "
+        f"echo \"preview(python3 '{sp}' --preview {{1}} --reverse)\"; "
+        f"fi"
+    )
+
     export_html_bind = (
-        f"ctrl-e:execute-silent(python3 '{sp}' --export-html {{1}})"
+        f"alt-h:execute-silent(python3 '{sp}' --export-html {{1}})"
     )
     export_org_bind = (
         f"ctrl-i:execute-silent(python3 '{sp}' --export-org {{1}})"
     )
 
     header = (
-        f"{DIM}⏎ confirm  esc back  / search  ` scope  "
-        f"ctrl-o order  ctrl-e html  ctrl-i org  ctrl-y copy{RESET}"
+        f"{DIM}⏎ confirm  M-⏎ resume  esc back  / search  ` scope  "
+        f"ctrl-o order  M-h html  ctrl-i org  ctrl-y copy{RESET}"
     )
     input_text = join_lines(search_lines)
 
@@ -519,6 +572,7 @@ def run_fzf(search_lines):
                 "--bind", order_toggle,
                 "--bind", export_html_bind,
                 "--bind", export_org_bind,
+                "--bind", focus_preview,
                 "--bind", "j:down,k:up",
                 "--bind", slash_bind,
                 "--bind", "start:unbind(j,k,/)",
