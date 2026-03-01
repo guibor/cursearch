@@ -25,14 +25,17 @@ MAX_READ_BYTES = 300_000
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
+UNDERLINE = "\033[4m"
 RESET = "\033[0m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 BLUE = "\033[34m"
+BRIGHT_BLUE = "\033[94m"
 YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
 WHITE = "\033[37m"
 GRAY = "\033[90m"
-MATCH_HL = "\033[1;33;4m"  # bold + yellow + underline for match highlights
+MATCH_HL = "\033[1;32;4m"  # bold + green + underline for match highlights
 
 
 # * Parsing
@@ -285,10 +288,10 @@ def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
         hl_project = highlight_matches(s['project'], query, CYAN + BOLD) if query else s['project']
         hl_summary = highlight_matches(summary, query, DIM) if query else summary
         card = (
-            f"{BOLD}{YELLOW}mod{RESET} {YELLOW}{modified_str}{RESET}"
-            f"  {DIM}cre {created_str}{RESET}"
-            f"  {CYAN}{BOLD}{hl_project}{RESET}"
-            f"  {DIM}({msg_count} msgs){RESET}\n"
+            f"{CYAN}{BOLD}{hl_project}{RESET}"
+            f"  {GRAY}({msg_count}){RESET}"
+            f"  {DIM}{modified_str}{RESET}"
+            f"  {GRAY}cre {created_str}{RESET}\n"
             f"  {DIM}{hl_summary}{RESET}"
             f" {GRAY}{DIM}{searchable}{RESET}"
         )
@@ -313,12 +316,10 @@ def preview_session(filepath, reverse=False, query="", latest_match=False):
     created, modified = get_file_times(filepath)
 
     header = (
-        f"{CYAN}{BOLD}Project:{RESET}  {WHITE}{project}{RESET}\n"
-        f"{CYAN}{BOLD}Created:{RESET}  {WHITE}{created.strftime('%Y-%m-%d %H:%M')}{RESET}\n"
-        f"{CYAN}{BOLD}Modified:{RESET} {WHITE}{modified.strftime('%Y-%m-%d %H:%M')}{RESET}\n"
-        f"{CYAN}{BOLD}File:{RESET}     {DIM}{filepath}{RESET}\n"
-        f"{CYAN}{BOLD}Messages:{RESET} {WHITE}{len(messages)}{RESET}\n"
-        f"{GRAY}{'─' * 60}{RESET}"
+        f"{BRIGHT_BLUE}{BOLD}{project}{RESET}"
+        f"  {GRAY}{len(messages)} messages{RESET}\n"
+        f"{DIM}{created.strftime('%Y-%m-%d %H:%M')} → {modified.strftime('%Y-%m-%d %H:%M')}{RESET}\n"
+        f"{GRAY}{'─' * 50}{RESET}"
     )
 
     display_msgs = list(reversed(messages)) if reverse else messages
@@ -347,9 +348,9 @@ def preview_session(filepath, reverse=False, query="", latest_match=False):
             text = text[:397] + "..."
         wrapped = textwrap.fill(text, width=72)
         if role == "user":
-            msg_lines.append(f"\n{GREEN}{BOLD}[USER]{RESET}\n{wrapped}")
+            msg_lines.append(f"\n{GREEN}{BOLD}USER{RESET}\n{wrapped}")
         else:
-            msg_lines.append(f"\n{BLUE}[ASST]{RESET}\n{DIM}{wrapped}{RESET}")
+            msg_lines.append(f"\n{BRIGHT_BLUE}{BOLD}ASST{RESET}\n{DIM}{wrapped}{RESET}")
 
     print(header)
     print("\n".join(msg_lines))
@@ -528,39 +529,37 @@ def export_markdown(filepath):
 # * Help overlay
 
 HELP_TEXT = f"""\
-{BOLD}{CYAN}cursearch — Cursor session search{RESET}
+{BRIGHT_BLUE}{BOLD}cursearch{RESET} {DIM}— Cursor session search{RESET}
 
-{YELLOW}── Navigation ──────────────────────────{RESET}
-  j / k           up / down {DIM}(browse mode){RESET}
-  ctrl-n / ctrl-p  up / down {DIM}(always){RESET}
-  alt-j / alt-k    up / down {DIM}(always){RESET}
+{CYAN}Navigation{RESET}
+  {WHITE}j / k{RESET}            up / down {DIM}(browse){RESET}
+  {WHITE}ctrl-n / ctrl-p{RESET}  up / down {DIM}(always){RESET}
+  {WHITE}alt-j / alt-k{RESET}    up / down {DIM}(always){RESET}
 
-{YELLOW}── Mode ────────────────────────────────{RESET}
-  Enter            resume session {DIM}(any mode){RESET}
-  Tab              enter browse mode {DIM}(from search){RESET}
-  Esc              browse → search
-  ctrl-c           quit
-  /                back to search {DIM}(browse mode){RESET}
+{CYAN}Mode{RESET}
+  {WHITE}Enter{RESET}            resume session
+  {WHITE}Tab{RESET}              enter browse mode
+  {WHITE}Esc{RESET}              browse → search
+  {WHITE}ctrl-c{RESET}           quit
+  {WHITE}/{RESET}                back to search {DIM}(browse){RESET}
 
-{YELLOW}── Selection ───────────────────────────{RESET}
-  x                toggle mark {DIM}(browse mode){RESET}
-  u                unmark + move down {DIM}(browse mode){RESET}
+{CYAN}Selection{RESET} {DIM}(browse mode){RESET}
+  {WHITE}x{RESET}                toggle mark
+  {WHITE}u{RESET}                unmark + move down
 
-{YELLOW}── Toggles ─────────────────────────────{RESET}
-  `                scope: all / user-only
-  ctrl-y           sort: modified / created
-  ctrl-o           preview: latest-match / newest / chrono
+{CYAN}Toggles{RESET}
+  {WHITE}`{RESET}                scope: all / user-only
+  {WHITE}ctrl-y{RESET}           sort: modified / created
+  {WHITE}ctrl-o{RESET}           preview: latest-match / newest / chrono
 
-{YELLOW}── Actions ─────────────────────────────{RESET}
-  ctrl-g           create skills from selected
-  alt-s            summarize selected {DIM}(headless agent){RESET}
-  alt-h            export to HTML
-  ctrl-i           export to Org-mode
-  alt-m            export to Markdown
+{CYAN}Actions{RESET}
+  {WHITE}ctrl-g{RESET}           create skills from selected
+  {WHITE}alt-s{RESET}            summarize selected {DIM}(agent --print){RESET}
+  {WHITE}alt-h{RESET}            export to HTML
+  {WHITE}ctrl-i{RESET}           export to Org-mode
+  {WHITE}alt-m{RESET}            export to Markdown
 
-{YELLOW}── Help ────────────────────────────────{RESET}
-  ?                this help {DIM}(browse mode){RESET}
-  {DIM}focus any item to restore preview{RESET}
+{DIM}focus any item to restore preview{RESET}
 """
 
 
@@ -973,7 +972,14 @@ def run_fzf(search_lines):
                 "--bind", "start:unbind(j,k,/,x,u,?)",
                 "--bind", "ctrl-n:down,ctrl-p:up,alt-j:down,alt-k:up",
                 "--bind", tab_bind,
-                "--color", "header:italic:dim",
+                "--color", "dark",
+                "--color", "fg:-1,bg:-1,hl:#a6e3a1,hl+:#a6e3a1:bold:underline",
+                "--color", "fg+:#cdd6f4,bg+:#313244",
+                "--color", "pointer:#89b4fa,marker:#a6e3a1:bold,prompt:#89b4fa",
+                "--color", "info:#6c7086,spinner:#89b4fa,header:#6c7086:italic",
+                "--color", "border:#45475a,preview-border:#45475a",
+                "--color", "preview-label:#89b4fa,label:#89b4fa",
+                "--color", "gutter:-1",
             ],
             input=input_text,
             text=True,
