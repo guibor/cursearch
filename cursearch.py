@@ -32,6 +32,7 @@ BLUE = "\033[34m"
 YELLOW = "\033[33m"
 WHITE = "\033[37m"
 GRAY = "\033[90m"
+MATCH_HL = "\033[1;33;4m"  # bold + yellow + underline for match highlights
 
 
 # * Parsing
@@ -218,6 +219,35 @@ def ordered_tokens_match(haystack, query):
     return True
 
 
+def highlight_matches(text, query, restore=""):
+    """Insert ANSI highlight around matching tokens in text.
+
+    restore is the ANSI code to re-apply after each highlight reset
+    (e.g. DIM so surrounding dim text stays dim).
+    """
+    tokens = parse_query_tokens(query)
+    if not tokens:
+        return text
+    for token in tokens:
+        if token.islower():
+            lower_text = text.lower()
+            lower_tok = token.lower()
+            parts = []
+            pos = 0
+            while pos < len(text):
+                idx = lower_text.find(lower_tok, pos)
+                if idx < 0:
+                    parts.append(text[pos:])
+                    break
+                parts.append(text[pos:idx])
+                parts.append(f"{MATCH_HL}{text[idx:idx+len(token)]}{RESET}{restore}")
+                pos = idx + len(token)
+            text = "".join(parts)
+        else:
+            text = text.replace(token, f"{MATCH_HL}{token}{RESET}{restore}")
+    return text
+
+
 def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
     """Build lines for fzf — one per session.
 
@@ -251,11 +281,15 @@ def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
         if not ordered_tokens_match(searchable, query):
             continue
 
+        msg_count = len(messages)
+        hl_project = highlight_matches(s['project'], query, CYAN + BOLD) if query else s['project']
+        hl_summary = highlight_matches(summary, query, DIM) if query else summary
         card = (
             f"{BOLD}{YELLOW}mod{RESET} {YELLOW}{modified_str}{RESET}"
             f"  {DIM}cre {created_str}{RESET}"
-            f"  {CYAN}{BOLD}{s['project']}{RESET}\n"
-            f"  {DIM}{summary}{RESET}"
+            f"  {CYAN}{BOLD}{hl_project}{RESET}"
+            f"  {DIM}({msg_count} msgs){RESET}\n"
+            f"  {DIM}{hl_summary}{RESET}"
             f" {GRAY}{DIM}{searchable}{RESET}"
         )
 
@@ -504,7 +538,8 @@ HELP_TEXT = f"""\
 {YELLOW}── Mode ────────────────────────────────{RESET}
   Enter            resume session {DIM}(any mode){RESET}
   Tab              enter browse mode {DIM}(from search){RESET}
-  Esc              browse → search / search → quit
+  Esc              browse → search
+  ctrl-c           quit
   /                back to search {DIM}(browse mode){RESET}
 
 {YELLOW}── Selection ───────────────────────────{RESET}
@@ -773,10 +808,11 @@ def run_fzf(search_lines):
     enter_bind = "enter:accept"
 
     # ** Tab: search->browse (freeze search, enable j/k/x/u/?)
+    # No-op if already in browse mode (empty echo = no fzf action).
     tab_bind = (
         "tab:transform:"
         "if echo \"$FZF_PROMPT\" | grep -q '>>'; then "
-        "echo ignore; "
+        "true; "
         "else "
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
         "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
@@ -785,7 +821,7 @@ def run_fzf(search_lines):
         "fi"
     )
 
-    # ** Esc: browse->search, search->quit
+    # ** Esc: browse->search (no-op if already in search; ctrl-c to quit)
     esc_bind = (
         "esc:transform:"
         "if echo \"$FZF_PROMPT\" | grep -q '>>'; then "
@@ -793,7 +829,7 @@ def run_fzf(search_lines):
         "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
         "echo \"unbind(j,k,/,x,u,?)+enable-search"
         "+change-prompt(cursearch [$SCOPE|$SORT]> )\"; "
-        "else echo abort; fi"
+        "fi"
     )
 
     # ** / (browse mode only, unbound in search): back to search
@@ -843,22 +879,24 @@ def run_fzf(search_lines):
         f"echo \"reload(python3 '{sp}' --lines $SCOPE --sort $SORT --query {{q}})\""
     )
 
-    # ** ctrl-o: cycle preview mode (latest-match -> newest-first -> chronological)
+    # ** ctrl-o: cycle preview mode via label; preview() is one-shot so it
+    # doesn't bake in {1}. focus:transform below re-renders on every move.
     order_toggle = (
         "ctrl-o:transform:"
         f"if echo \"$FZF_PREVIEW_LABEL\" | grep -q latest; then "
-        f"echo \"change-preview(python3 '{sp}' --preview {{1}} --reverse)"
-        "+change-preview-label([ ↑ newest first ])\"; "
+        f"echo \"change-preview-label([ ↑ newest first ])"
+        f"+preview(python3 '{sp}' --preview {{1}} --reverse)\"; "
         f"elif echo \"$FZF_PREVIEW_LABEL\" | grep -q newest; then "
-        f"echo \"change-preview(python3 '{sp}' --preview {{1}})"
-        "+change-preview-label([ ↓ chronological ])\"; "
+        f"echo \"change-preview-label([ ↓ chronological ])"
+        f"+preview(python3 '{sp}' --preview {{1}})\"; "
         f"else "
-        f"echo \"change-preview(python3 '{sp}' --preview {{1}} --latest-match --query {{q}})"
-        "+change-preview-label([ ◎ latest match ])\"; "
+        f"echo \"change-preview-label([ ◎ latest match ])"
+        f"+preview(python3 '{sp}' --preview {{1}} --latest-match --query {{q}})\"; "
         "fi"
     )
 
-    # ** focus: force preview refresh on every selection change
+    # ** focus: rebuild preview command from scratch using the label to detect
+    # mode and {1}/{q} for the focused item. Runs on every navigation.
     focus_preview = (
         "focus:transform:"
         f"if echo \"$FZF_PREVIEW_LABEL\" | grep -q latest; then "
@@ -917,7 +955,6 @@ def run_fzf(search_lines):
                 "--info", "inline",
                 "--prompt", "cursearch [all|mod]> ",
                 "--bind", enter_bind,
-                "--bind", tab_bind,
                 "--bind", esc_bind,
                 "--bind", scope_toggle,
                 "--bind", sort_toggle,
@@ -935,6 +972,7 @@ def run_fzf(search_lines):
                 "--bind", slash_bind,
                 "--bind", "start:unbind(j,k,/,x,u,?)",
                 "--bind", "ctrl-n:down,ctrl-p:up,alt-j:down,alt-k:up",
+                "--bind", tab_bind,
                 "--color", "header:italic:dim",
             ],
             input=input_text,
