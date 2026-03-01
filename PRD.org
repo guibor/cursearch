@@ -1,0 +1,39 @@
+#+title: Cursearch Product Requirements
+#+options: toc:nil num:nil ^:{}
+
+* Future Plans (Deferred)
+** Storage and Diagnostics
+- Add a =cursearch doctor= command that reports:
+  - detected storage backends
+  - session file counts
+  - path resolution diagnostics
+  - parse and index health
+- Add optional =--storage= override for advanced users.
+- Add optional copy-on-read mode for DB-backed storage to avoid lock issues.
+
+** Non-Interactive Commands
+- Add =cursearch list --query ...= for scriptable session discovery.
+- Add =cursearch export= with stable formats (jsonl, org, md) for selected sessions.
+- Add explicit machine-readable output mode for automation.
+
+** Backend Expansion
+- Keep transcript-first backend as default.
+- Add pluggable backend abstraction for:
+  - agent transcript files
+  - Cursor desktop globalStorage DB
+  - future session stores
+
+* External Research Notes (cursor-session repo)
+** What it does well
+- Multi-backend storage detection and selection.
+- Healthcheck/snoop-style diagnostics.
+- Caching and normalized export pipeline.
+- Workspace association from Cursor workspace storage metadata.
+
+** What to adapt later (not now)
+- Keep current TUI-first UX.
+- Borrow only high-value reliability features:
+  - doctor diagnostics
+  - optional storage override
+  - optional export CLI
+

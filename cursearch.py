@@ -19,7 +19,7 @@ from pathlib import Path
 CURSOR_PROJECTS_DIR = Path.home() / ".cursor" / "projects"
 HOME_PREFIX = str(Path.home()).lstrip("/").replace("/", "-") + "-"
 MAX_SUMMARY_QUERIES = 5
-MAX_READ_BYTES = 50_000
+MAX_READ_BYTES = 300_000
 
 # * ANSI colors
 
@@ -192,7 +192,33 @@ def make_summary(messages):
     return " | ".join(parts) if parts else "(empty session)"
 
 
-def build_search_lines(sessions, scope="all", sort_by="modified"):
+def parse_query_tokens(query):
+    """Split query into non-empty whitespace-separated tokens."""
+    return [t for t in query.split() if t]
+
+
+def token_contains(haystack, token):
+    """Smart-case token search: lowercase token -> case-insensitive, else sensitive."""
+    if token.islower():
+        return haystack.lower().find(token.lower())
+    return haystack.find(token)
+
+
+def ordered_tokens_match(haystack, query):
+    """Ordered token match with smart-case and gap allowance between tokens."""
+    tokens = parse_query_tokens(query)
+    if not tokens:
+        return True
+    start = 0
+    for token in tokens:
+        idx = token_contains(haystack[start:], token)
+        if idx < 0:
+            return False
+        start += idx + len(token)
+    return True
+
+
+def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
     """Build lines for fzf — one per session.
 
     Each line is a single fzf entry with tab-separated fields:
@@ -222,8 +248,8 @@ def build_search_lines(sessions, scope="all", sort_by="modified"):
         summary = make_summary(messages)
 
         searchable = " ".join(strip_tags(t).replace("\n", " ") for _, t in filtered)
-        if len(searchable) > 4000:
-            searchable = searchable[:4000]
+        if not ordered_tokens_match(searchable, query):
+            continue
 
         card = (
             f"{BOLD}{YELLOW}mod{RESET} {YELLOW}{modified_str}{RESET}"
@@ -245,7 +271,7 @@ def join_lines(lines):
 
 # * Preview (called by fzf subprocess)
 
-def preview_session(filepath, reverse=False):
+def preview_session(filepath, reverse=False, query="", latest_match=False):
     """Print a colored preview of a session transcript."""
     messages = parse_transcript(filepath)
     project_dir = Path(filepath).parent.parent.name
@@ -262,6 +288,21 @@ def preview_session(filepath, reverse=False):
     )
 
     display_msgs = list(reversed(messages)) if reverse else messages
+
+    if latest_match and query.strip():
+        last_idx = -1
+        for i, (_, text) in enumerate(messages):
+            if ordered_tokens_match(text, query):
+                last_idx = i
+        if last_idx >= 0:
+            start = max(0, last_idx - 6)
+            end = min(len(messages), last_idx + 8)
+            display_msgs = messages[start:end]
+        else:
+            msg = f"{YELLOW}[no match]{RESET} No message matches query: {query}"
+            print(header)
+            print(msg)
+            return
 
     msg_lines = []
     for role, text in display_msgs:
@@ -408,6 +449,91 @@ def export_org(filepath):
     subprocess.Popen(["open", tmp_path])
 
 
+# * Markdown export
+
+def export_markdown(filepath):
+    """Export a session transcript to Markdown and open in default editor."""
+    messages = parse_transcript(filepath)
+    project_dir = Path(filepath).parent.parent.name
+    project = short_project_name(project_dir)
+    created, modified = get_file_times(filepath)
+
+    lines = [
+        f"# Cursor Session — {project}",
+        "",
+        f"- **Project:** {project}",
+        f"- **Created:** {created.strftime('%Y-%m-%d %H:%M')}",
+        f"- **Modified:** {modified.strftime('%Y-%m-%d %H:%M')}",
+        f"- **Messages:** {len(messages)}",
+        "",
+        "---",
+        "",
+    ]
+
+    for role, text in messages:
+        text = strip_tags(text)
+        if not text:
+            continue
+        if role == "user":
+            heading = make_heading_text(text)
+            lines.append(f"## {heading}")
+            lines.append("")
+            lines.append(text)
+        else:
+            lines.append("### Assistant")
+            lines.append("")
+            lines.append(text)
+        lines.append("")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".md", prefix="cursearch_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    subprocess.Popen(["open", tmp_path])
+
+
+# * Help overlay
+
+HELP_TEXT = f"""\
+{BOLD}{CYAN}cursearch — Cursor session search{RESET}
+
+{YELLOW}── Navigation ──────────────────────────{RESET}
+  j / k           up / down {DIM}(browse mode){RESET}
+  ctrl-n / ctrl-p  up / down {DIM}(always){RESET}
+  alt-j / alt-k    up / down {DIM}(always){RESET}
+
+{YELLOW}── Mode ────────────────────────────────{RESET}
+  Enter            resume session {DIM}(any mode){RESET}
+  Tab              enter browse mode {DIM}(from search){RESET}
+  Esc              browse → search / search → quit
+  /                back to search {DIM}(browse mode){RESET}
+
+{YELLOW}── Selection ───────────────────────────{RESET}
+  x                toggle mark {DIM}(browse mode){RESET}
+  u                unmark + move down {DIM}(browse mode){RESET}
+
+{YELLOW}── Toggles ─────────────────────────────{RESET}
+  `                scope: all / user-only
+  ctrl-y           sort: modified / created
+  ctrl-o           preview: latest-match / newest / chrono
+
+{YELLOW}── Actions ─────────────────────────────{RESET}
+  ctrl-g           create skills from selected
+  alt-s            summarize selected {DIM}(headless agent){RESET}
+  alt-h            export to HTML
+  ctrl-i           export to Org-mode
+  alt-m            export to Markdown
+
+{YELLOW}── Help ────────────────────────────────{RESET}
+  ?                this help {DIM}(browse mode){RESET}
+  {DIM}focus any item to restore preview{RESET}
+"""
+
+
+def print_help_overlay():
+    """Print the formatted help text for the fzf preview pane."""
+    print(HELP_TEXT)
+
+
 # * Resume session
 
 def decode_project_path(dirname):
@@ -449,6 +575,7 @@ def decode_project_path(dirname):
 
 ABS_PATH_RE = re.compile(r"/Users/[^\n\"'`<>]+")
 WORKDIR_RE = re.compile(r'working_directory:\s*(?:"([^"\n]+)"|([^\s"\n]+))')
+REL_PATH_RE = re.compile(r"(?:`|\\b)([A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+)")
 
 
 def infer_resume_cwd(transcript_path, project_path):
@@ -497,6 +624,24 @@ def infer_resume_cwd(transcript_path, project_path):
             continue
         candidates[real] += 2
 
+    # Learn likely cwd from relative path mentions like "tsr-japan/file.org".
+    for m in REL_PATH_RE.finditer(raw):
+        rel_path = (m.group(1) or "").strip().strip("`")
+        if not rel_path or rel_path.startswith(".cursor/"):
+            continue
+        parts = rel_path.split("/")
+        if not parts:
+            continue
+        top = parts[0]
+        top_dir = os.path.realpath(os.path.join(project_real, top))
+        if os.path.isdir(top_dir):
+            try:
+                if os.path.commonpath([top_dir, project_real]) != project_real:
+                    continue
+            except ValueError:
+                continue
+            candidates[top_dir] += 3
+
     if not candidates:
         return project_path
 
@@ -507,15 +652,105 @@ def infer_resume_cwd(transcript_path, project_path):
 
 def resume_session(filepath):
     """Resume a Cursor CLI agent session. Replaces the current process."""
-    session_id = Path(filepath).stem
+    filepath_str = str(filepath)
+    session_id = Path(filepath_str).stem
+    # Defensive fallback: extract canonical UUID from path if stem is malformed.
+    if len(session_id) != 36:
+        m = re.search(
+            r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+            filepath_str,
+            re.IGNORECASE,
+        )
+        if m:
+            session_id = m.group(1)
     project_dirname = Path(filepath).parent.parent.name
     project_path = decode_project_path(project_dirname)
-    resume_cwd = infer_resume_cwd(filepath, project_path)
-    cmd = ["agent", f"--resume={session_id}", "--workspace", resume_cwd]
+    # Bulletproof default: use workspace encoded by transcript container dir.
+    # Heuristic subdir inference can point at the wrong workspace and cause
+    # "resume" to start a new empty session context.
+    resume_cwd = project_path
+    cmd = ["agent", "--resume", session_id, "--workspace", resume_cwd]
     print(f"[cursearch] project {project_path}", file=sys.stderr)
     print(f"[cursearch] cd {resume_cwd}", file=sys.stderr)
+    print(f"[cursearch] session_id {session_id} (len={len(session_id)})", file=sys.stderr)
     print(f"[cursearch] {' '.join(cmd)}", file=sys.stderr)
     os.chdir(resume_cwd)
+    os.execvp("agent", cmd)
+
+
+def summarize_sessions(filepaths):
+    """Summarize selected sessions via headless agent --print."""
+    excerpts = []
+    for fp in filepaths:
+        fp = fp.strip()
+        if not fp:
+            continue
+        messages = parse_transcript(fp)
+        if not messages:
+            continue
+        project_dir = Path(fp).parent.parent.name
+        project = short_project_name(project_dir)
+        _, modified = get_file_times(fp)
+        lines = [f"=== {project} ({modified.strftime('%Y-%m-%d')}) ==="]
+        budget = 6000
+        for role, text in messages:
+            text = strip_tags(text)
+            if not text:
+                continue
+            label = "USER" if role == "user" else "ASST"
+            if role != "user" and len(text) > 300:
+                text = text[:297] + "..."
+            entry = f"{label}: {text}"
+            if len(entry) > budget:
+                entry = entry[:budget]
+            lines.append(entry)
+            budget -= len(entry)
+            if budget <= 0:
+                break
+        excerpts.append("\n".join(lines))
+
+    if not excerpts:
+        print("No transcript content to summarize.", file=sys.stderr)
+        return
+
+    prompt = (
+        "Summarize these Cursor agent sessions concisely. "
+        "Output a single bulleted list of main topics, decisions, and outcomes. "
+        "Fit in one terminal screen (~30 lines max). No headers, no fluff.\n\n"
+        + "\n\n".join(excerpts)
+    )
+    os.execvp("agent", ["agent", "--print", "--model", "auto", "--trust", prompt])
+
+
+def launch_create_skills_agent(filepaths):
+    """Launch agent with a generated prompt to create skills from sessions."""
+    # Final safety dedupe before handoff to agent.
+    unique_paths = []
+    seen = set()
+    for fp in filepaths:
+        abs_fp = os.path.abspath(fp)
+        if abs_fp in seen:
+            continue
+        seen.add(abs_fp)
+        unique_paths.append(abs_fp)
+
+    if not unique_paths:
+        return
+
+    path_lines = "\n".join(f"- {p}" for p in unique_paths)
+    prompt = (
+        "Create actionable skills from the selected Cursor agent sessions.\n\n"
+        "Use the create-skill skill to produce a few high-quality, reusable skills.\n\n"
+        "Selected transcript files:\n"
+        f"{path_lines}\n\n"
+        "Requirements:\n"
+        "- Read those transcripts first.\n"
+        "- Identify repeated workflows and decision patterns.\n"
+        "- Create 3-7 practical skills with clear triggers, steps, and constraints.\n"
+        "- Prefer concise, executable skills over generic advice.\n"
+    )
+    cmd = ["agent", "--plan", prompt]
+    print(f"[cursearch] launching skill synthesis from {len(unique_paths)} sessions", file=sys.stderr)
     os.execvp("agent", cmd)
 
 
@@ -524,8 +759,9 @@ def resume_session(filepath):
 def run_fzf(search_lines):
     """Launch fzf with two modes: search and browse.
 
-    Search mode: type to filter. Enter confirms search -> browse mode.
-    Browse mode: j/k navigate. Enter accepts (returns selection). Esc -> search.
+    Search mode: type to filter. Enter/alt-Enter resumes selected session.
+                 Tab enters browse mode.
+    Browse mode: j/k navigate. Enter resumes. Esc or / returns to search.
 
     Column layout: 1=filepath  2=card_with_search_text
     Mode is tracked via prompt: '> ' = search, '>> ' = browse.
@@ -533,21 +769,21 @@ def run_fzf(search_lines):
     """
     sp = os.path.abspath(__file__)
 
-    # ** Enter: search->browse, browse->accept (return selection to Python)
-    enter_bind = (
-        "enter:transform:"
+    # ** Enter: always accept (resume selected session)
+    enter_bind = "enter:accept"
+
+    # ** Tab: search->browse (freeze search, enable j/k/x/u/?)
+    tab_bind = (
+        "tab:transform:"
         "if echo \"$FZF_PROMPT\" | grep -q '>>'; then "
-        "echo accept; "
+        "echo ignore; "
         "else "
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
         "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
-        "echo \"rebind(j,k,/)+disable-search"
+        "echo \"rebind(j,k,/,x,u,?)+disable-search"
         "+change-prompt(cursearch [$SCOPE|$SORT]>> )\"; "
         "fi"
     )
-
-    # ** alt-Enter: always accept → resume from any mode
-    alt_enter_bind = "alt-enter:accept"
 
     # ** Esc: browse->search, search->quit
     esc_bind = (
@@ -555,7 +791,7 @@ def run_fzf(search_lines):
         "if echo \"$FZF_PROMPT\" | grep -q '>>'; then "
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
         "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
-        "echo \"unbind(j,k,/)+enable-search"
+        "echo \"unbind(j,k,/,x,u,?)+enable-search"
         "+change-prompt(cursearch [$SCOPE|$SORT]> )\"; "
         "else echo abort; fi"
     )
@@ -565,7 +801,7 @@ def run_fzf(search_lines):
         "/:transform:"
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
         "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
-        "echo \"unbind(j,k,/)+enable-search"
+        "echo \"unbind(j,k,/,x,u,?)+enable-search"
         "+change-prompt(cursearch [$SCOPE|$SORT]> )\""
     )
 
@@ -576,10 +812,10 @@ def run_fzf(search_lines):
         "else SEP='> '; fi; "
         "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
         f"if echo \"$FZF_PROMPT\" | grep -q all; then "
-        f"echo \"reload(python3 '{sp}' --lines user --sort $SORT)"
+        f"echo \"reload(python3 '{sp}' --lines user --sort $SORT --query {{q}})"
         "+change-prompt(cursearch [user|$SORT]$SEP)\"; "
         f"else "
-        f"echo \"reload(python3 '{sp}' --lines all --sort $SORT)"
+        f"echo \"reload(python3 '{sp}' --lines all --sort $SORT --query {{q}})"
         "+change-prompt(cursearch [all|$SORT]$SEP)\"; "
         "fi"
     )
@@ -591,30 +827,43 @@ def run_fzf(search_lines):
         "else SEP='> '; fi; "
         "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
         f"if echo \"$FZF_PROMPT\" | grep -q '|mod'; then "
-        f"echo \"reload(python3 '{sp}' --lines $SCOPE --sort cre)"
+        f"echo \"reload(python3 '{sp}' --lines $SCOPE --sort cre --query {{q}})"
         "+change-prompt(cursearch [$SCOPE|cre]$SEP)\"; "
         "else "
-        f"echo \"reload(python3 '{sp}' --lines $SCOPE --sort mod)"
+        f"echo \"reload(python3 '{sp}' --lines $SCOPE --sort mod --query {{q}})"
         "+change-prompt(cursearch [$SCOPE|mod]$SEP)\"; "
         "fi"
     )
 
-    # ** ctrl-o: toggle preview order
+    # ** query change: python-side filtering with ordered smart-case semantics
+    query_change = (
+        "change:transform:"
+        "SCOPE=$(echo \"$FZF_PROMPT\" | grep -oE 'all|user'); "
+        "SORT=$(echo \"$FZF_PROMPT\" | grep -oE 'mod|cre'); "
+        f"echo \"reload(python3 '{sp}' --lines $SCOPE --sort $SORT --query {{q}})\""
+    )
+
+    # ** ctrl-o: cycle preview mode (latest-match -> newest-first -> chronological)
     order_toggle = (
         "ctrl-o:transform:"
-        f"if echo \"$FZF_PREVIEW_LABEL\" | grep -q chronological; then "
+        f"if echo \"$FZF_PREVIEW_LABEL\" | grep -q latest; then "
         f"echo \"change-preview(python3 '{sp}' --preview {{1}} --reverse)"
         "+change-preview-label([ ↑ newest first ])\"; "
-        f"else "
+        f"elif echo \"$FZF_PREVIEW_LABEL\" | grep -q newest; then "
         f"echo \"change-preview(python3 '{sp}' --preview {{1}})"
         "+change-preview-label([ ↓ chronological ])\"; "
+        f"else "
+        f"echo \"change-preview(python3 '{sp}' --preview {{1}} --latest-match --query {{q}})"
+        "+change-preview-label([ ◎ latest match ])\"; "
         "fi"
     )
 
     # ** focus: force preview refresh on every selection change
     focus_preview = (
         "focus:transform:"
-        f"if echo \"$FZF_PREVIEW_LABEL\" | grep -q chronological; then "
+        f"if echo \"$FZF_PREVIEW_LABEL\" | grep -q latest; then "
+        f"echo \"preview(python3 '{sp}' --preview {{1}} --latest-match --query {{q}})\"; "
+        f"elif echo \"$FZF_PREVIEW_LABEL\" | grep -q chronological; then "
         f"echo \"preview(python3 '{sp}' --preview {{1}})\"; "
         f"else "
         f"echo \"preview(python3 '{sp}' --preview {{1}} --reverse)\"; "
@@ -627,10 +876,23 @@ def run_fzf(search_lines):
     export_org_bind = (
         f"ctrl-i:execute-silent(python3 '{sp}' --export-org {{1}})"
     )
+    export_md_bind = (
+        f"alt-m:execute-silent(python3 '{sp}' --export-md {{1}})"
+    )
+
+    # ** alt-s: summarize selected sessions via headless agent
+    summarize_bind = (
+        f"alt-s:execute(python3 '{sp}' --summarize {{+1}})"
+    )
+
+    # ** ?: show help overlay in preview pane (browse mode only)
+    help_bind = (
+        f"?:preview(python3 '{sp}' --help-overlay)"
+        "+change-preview-label([ ? help ])"
+    )
 
     header = (
-        f"{DIM}⏎ confirm  M-⏎ resume  esc back  / search  ` scope  "
-        f"ctrl-y sort(mod/cre)  ctrl-o preview-order  M-h html  ctrl-i org{RESET}"
+        f"{DIM}⏎ resume  Tab browse  x/u select  ctrl-g skills  alt-s summary  ? help{RESET}"
     )
     input_text = join_lines(search_lines)
 
@@ -639,13 +901,15 @@ def run_fzf(search_lines):
             [
                 "fzf",
                 "--ansi",
-                "--exact",
+                "--multi",
+                "--disabled",
                 "--read0",
                 "--delimiter", "\t",
                 "--with-nth", "2",
-                "--preview", f"python3 '{sp}' --preview {{1}} --reverse",
+                "--expect", "ctrl-g",
+                "--preview", f"python3 '{sp}' --preview {{1}} --latest-match --query {{q}}",
                 "--preview-window", "right:50%:wrap",
-                "--preview-label", "[ ↑ newest first ]",
+                "--preview-label", "[ ◎ latest match ]",
                 "--header", header,
                 "--layout", "reverse",
                 "--no-sort",
@@ -653,17 +917,23 @@ def run_fzf(search_lines):
                 "--info", "inline",
                 "--prompt", "cursearch [all|mod]> ",
                 "--bind", enter_bind,
-                "--bind", alt_enter_bind,
+                "--bind", tab_bind,
                 "--bind", esc_bind,
                 "--bind", scope_toggle,
                 "--bind", sort_toggle,
+                "--bind", query_change,
                 "--bind", order_toggle,
                 "--bind", export_html_bind,
                 "--bind", export_org_bind,
+                "--bind", export_md_bind,
+                "--bind", summarize_bind,
+                "--bind", help_bind,
                 "--bind", focus_preview,
                 "--bind", "j:down,k:up",
+                "--bind", "x:toggle",
+                "--bind", "u:deselect+down",
                 "--bind", slash_bind,
-                "--bind", "start:unbind(j,k,/)",
+                "--bind", "start:unbind(j,k,/,x,u,?)",
                 "--bind", "ctrl-n:down,ctrl-p:up,alt-j:down,alt-k:up",
                 "--color", "header:italic:dim",
             ],
@@ -676,20 +946,41 @@ def run_fzf(search_lines):
         sys.exit(1)
 
     if result.returncode == 0 and result.stdout.strip():
-        parts = result.stdout.strip().split("\t")
-        if parts:
-            return parts[0]
+        raw_lines = [ln for ln in result.stdout.strip().splitlines() if ln.strip()]
+        if not raw_lines:
+            return None, []
+
+        action = "resume"
+        selected_lines = raw_lines
+        if raw_lines[0] == "ctrl-g":
+            action = "create_skills"
+            selected_lines = raw_lines[1:]
+
+        filepaths = []
+        seen_paths = set()
+        for ln in selected_lines:
+            # Ignore wrapped/multiline display spillover lines; real entries
+            # always include the hidden filepath column and a tab delimiter.
+            if "\t" not in ln:
+                continue
+            filepath = ln.split("\t", 1)[0]
+            if not filepath or filepath in seen_paths:
+                continue
+            seen_paths.add(filepath)
+            filepaths.append(filepath)
+        if filepaths:
+            return action, filepaths
     elif result.returncode not in (0, 1, 130):
         print(f"fzf error (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
-    return None
+    return None, []
 
 
 # * Main
 
-def emit_lines(scope, sort_by="modified"):
+def emit_lines(scope, sort_by="modified", query=""):
     """Print fzf lines to stdout (null-delimited) — used by fzf reload."""
     sessions = scan_all_transcripts()
-    lines = build_search_lines(sessions, scope=scope, sort_by=sort_by)
+    lines = build_search_lines(sessions, scope=scope, sort_by=sort_by, query=query)
     sys.stdout.write(join_lines(lines))
     sys.stdout.flush()
 
@@ -697,7 +988,13 @@ def emit_lines(scope, sort_by="modified"):
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
         reverse = "--reverse" in sys.argv[3:]
-        preview_session(sys.argv[2], reverse=reverse)
+        latest_match = "--latest-match" in sys.argv[3:]
+        query = ""
+        if "--query" in sys.argv[3:]:
+            idx = sys.argv.index("--query")
+            if idx + 1 < len(sys.argv):
+                query = sys.argv[idx + 1]
+        preview_session(sys.argv[2], reverse=reverse, query=query, latest_match=latest_match)
         return
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--resume":
@@ -712,11 +1009,28 @@ def main():
         export_org(sys.argv[2])
         return
 
+    if len(sys.argv) >= 3 and sys.argv[1] == "--export-md":
+        export_markdown(sys.argv[2])
+        return
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--summarize":
+        summarize_sessions(sys.argv[2:])
+        return
+
+    if sys.argv[1:2] == ["--help-overlay"]:
+        print_help_overlay()
+        return
+
     if len(sys.argv) >= 3 and sys.argv[1] == "--lines":
         sort_by = "modified"
+        query = ""
         if len(sys.argv) >= 5 and sys.argv[3] == "--sort":
             sort_by = "created" if sys.argv[4] == "cre" else "modified"
-        emit_lines(sys.argv[2], sort_by=sort_by)
+        if "--query" in sys.argv:
+            idx = sys.argv.index("--query")
+            if idx + 1 < len(sys.argv):
+                query = sys.argv[idx + 1]
+        emit_lines(sys.argv[2], sort_by=sort_by, query=query)
         return
 
     print("Scanning Cursor agent transcripts...", file=sys.stderr)
@@ -728,11 +1042,15 @@ def main():
         return
 
     print("Building search index...", file=sys.stderr)
-    lines = build_search_lines(sessions, scope="all")
+    lines = build_search_lines(sessions, scope="all", sort_by="modified", query="")
 
-    selected = run_fzf(lines)
-    if selected:
-        resume_session(selected)
+    action, selected = run_fzf(lines)
+    if not selected:
+        return
+    if action == "create_skills":
+        launch_create_skills_agent(selected)
+        return
+    resume_session(selected[0])
 
 
 main()
