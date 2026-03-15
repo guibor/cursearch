@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -56,4 +57,39 @@ class TestSkillLaunchUniqueness(unittest.TestCase):
         self.assertIn("- " + os.path.abspath("./a.jsonl"), prompt)
         self.assertIn("- " + os.path.abspath("./b.jsonl"), prompt)
         self.assertEqual(prompt.count(os.path.abspath("./a.jsonl")), 1)
+
+
+class TestFullSearchIndexing(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ns = load_cursearch_namespace()
+
+    def test_build_session_search_record_indexes_full_transcript(self):
+        huge_prefix = "x" * 350_000
+        transcript = (
+            '{"role":"user","message":{"content":[{"type":"text","text":"'
+            + huge_prefix
+            + ' tail_marker_query"}]}}\n'
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tmp:
+            tmp.write(transcript)
+            tmp_path = tmp.name
+
+        try:
+            record = self.ns["build_session_search_record"](tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        self.assertIn("tail_marker_query", record["searchable_all"])
+        self.assertTrue(
+            self.ns["ordered_tokens_match"](record["searchable_all"], "tail_marker_query")
+        )
+
+    def test_make_search_excerpt_centers_near_match(self):
+        excerpt = self.ns["make_search_excerpt"](
+            "alpha beta gamma delta epsilon zeta eta theta",
+            "epsilon",
+            max_chars=20,
+        )
+        self.assertIn("epsilon", excerpt)
 

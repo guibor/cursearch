@@ -5,6 +5,7 @@ import html as html_mod
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,8 @@ from pathlib import Path
 CURSOR_PROJECTS_DIR = Path.home() / ".cursor" / "projects"
 HOME_PREFIX = str(Path.home()).lstrip("/").replace("/", "-") + "-"
 MAX_SUMMARY_QUERIES = 5
-MAX_READ_BYTES = 300_000
+SEARCH_CACHE_DB = Path(tempfile.gettempdir()) / "cursearch_search_cache.sqlite3"
+SEARCH_EXCERPT_CHARS = 180
 
 # * ANSI colors
 
@@ -251,53 +253,260 @@ def highlight_matches(text, query, restore=""):
     return text
 
 
+def make_search_excerpt(text, query="", max_chars=SEARCH_EXCERPT_CHARS):
+    """Return a short contextual excerpt for display in the search UI."""
+    text = text.replace("\n", " ").strip()
+    if not text:
+        return "(no transcript text)"
+
+    start = 0
+    tokens = parse_query_tokens(query)
+    if tokens:
+        idx = token_contains(text, tokens[0])
+        if idx >= 0:
+            start = max(0, idx - max_chars // 3)
+
+    excerpt = text[start:start + max_chars].strip()
+    if start > 0:
+        excerpt = "..." + excerpt
+    if start + max_chars < len(text):
+        excerpt = excerpt + "..."
+    return excerpt
+
+
+def open_search_cache():
+    """Open the persistent SQLite FTS5 search cache.
+
+    Schema: a metadata table for cache invalidation plus an FTS5
+    virtual table for fast full-text matching.
+    """
+    conn = sqlite3.connect(str(SEARCH_CACHE_DB))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS transcript_meta (
+            filepath TEXT PRIMARY KEY,
+            mtime_ns INTEGER NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            msg_count INTEGER NOT NULL,
+            summary TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
+            filepath UNINDEXED,
+            searchable_all,
+            searchable_user,
+            searchable_assistant,
+            tokenize = 'unicode61 remove_diacritics 2 tokenchars _'
+        )
+        """
+    )
+    return conn
+
+
+def build_session_search_record(filepath):
+    """Build full-text search fields for a transcript file."""
+    messages = parse_transcript(filepath)
+    cleaned_messages = []
+    for role, text in messages:
+        text = strip_tags(text)
+        if not text:
+            continue
+        cleaned_messages.append((role, text))
+
+    searchable_all = " ".join(t.replace("\n", " ") for _, t in cleaned_messages)
+    searchable_user = " ".join(t.replace("\n", " ") for r, t in cleaned_messages if r == "user")
+    searchable_assistant = " ".join(
+        t.replace("\n", " ") for r, t in cleaned_messages if r == "assistant"
+    )
+    return {
+        "msg_count": len(cleaned_messages),
+        "summary": make_summary(cleaned_messages),
+        "searchable_all": searchable_all,
+        "searchable_user": searchable_user,
+        "searchable_assistant": searchable_assistant,
+    }
+
+
+def _fts_delete_row(conn, filepath):
+    """Remove a row from the FTS5 table by filepath."""
+    old = conn.execute(
+        "SELECT rowid, searchable_all, searchable_user, searchable_assistant "
+        "FROM transcript_fts WHERE filepath = ?",
+        (filepath,),
+    ).fetchone()
+    if old:
+        conn.execute(
+            "INSERT INTO transcript_fts(transcript_fts, rowid, filepath, "
+            "searchable_all, searchable_user, searchable_assistant) "
+            "VALUES('delete', ?, ?, ?, ?, ?)",
+            (old["rowid"], filepath, old["searchable_all"],
+             old["searchable_user"], old["searchable_assistant"]),
+        )
+
+
+def ensure_search_cache(conn, sessions):
+    """Ensure the SQLite FTS5 cache has current full-text data for all sessions."""
+    valid_paths = set()
+    for s in sessions:
+        filepath = s["filepath"]
+        valid_paths.add(filepath)
+        stat = os.stat(filepath)
+        row = conn.execute(
+            "SELECT mtime_ns, size_bytes FROM transcript_meta WHERE filepath = ?",
+            (filepath,),
+        ).fetchone()
+        if row and row["mtime_ns"] == stat.st_mtime_ns and row["size_bytes"] == stat.st_size:
+            continue
+
+        record = build_session_search_record(filepath)
+
+        _fts_delete_row(conn, filepath)
+
+        conn.execute(
+            """
+            INSERT INTO transcript_meta (filepath, mtime_ns, size_bytes, msg_count, summary)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(filepath) DO UPDATE SET
+                mtime_ns = excluded.mtime_ns,
+                size_bytes = excluded.size_bytes,
+                msg_count = excluded.msg_count,
+                summary = excluded.summary
+            """,
+            (filepath, stat.st_mtime_ns, stat.st_size,
+             record["msg_count"], record["summary"]),
+        )
+        conn.execute(
+            "INSERT INTO transcript_fts (filepath, searchable_all, "
+            "searchable_user, searchable_assistant) VALUES (?, ?, ?, ?)",
+            (filepath, record["searchable_all"],
+             record["searchable_user"], record["searchable_assistant"]),
+        )
+
+    stale_paths = [
+        row["filepath"]
+        for row in conn.execute("SELECT filepath FROM transcript_meta").fetchall()
+        if row["filepath"] not in valid_paths
+    ]
+    for p in stale_paths:
+        _fts_delete_row(conn, p)
+        conn.execute("DELETE FROM transcript_meta WHERE filepath = ?", (p,))
+
+    conn.commit()
+
+
+def _build_fts_query(query):
+    """Translate a user query string into an FTS5 MATCH expression.
+
+    Each whitespace-separated token becomes an FTS5 prefix token (tok*),
+    and they are ANDed together so all tokens must appear.
+    """
+    tokens = parse_query_tokens(query)
+    if not tokens:
+        return None
+    fts_tokens = []
+    for tok in tokens:
+        safe = tok.replace('"', '""')
+        fts_tokens.append(f'"{safe}" *')
+    return " AND ".join(fts_tokens)
+
+
+def _fts_scope_column(scope):
+    """Return the FTS5 column name for the given scope."""
+    if scope == "user":
+        return "searchable_user"
+    if scope == "assistant":
+        return "searchable_assistant"
+    return "searchable_all"
+
+
+def search_sessions(conn, query, scope="all"):
+    """Search sessions using FTS5. Returns set of matching filepaths."""
+    fts_expr = _build_fts_query(query)
+    if fts_expr is None:
+        return None
+
+    col = _fts_scope_column(scope)
+    try:
+        rows = conn.execute(
+            f"SELECT filepath FROM transcript_fts WHERE {col} MATCH ?",
+            (fts_expr,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {row["filepath"] for row in rows}
+
+
+def get_searchable_text(conn, filepath, scope="all"):
+    """Retrieve the cached searchable text for a session."""
+    col = _fts_scope_column(scope)
+    row = conn.execute(
+        f"SELECT {col} FROM transcript_fts WHERE filepath = ?",
+        (filepath,),
+    ).fetchone()
+    return row[col] if row else ""
+
+
 def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
     """Build lines for fzf — one per session.
 
     Each line is a single fzf entry with tab-separated fields:
-      filepath \\t visible_card_with_hidden_search_text
+      filepath \\t visible_card
 
-    The visible card is ANSI-formatted. The searchable blob is appended
-    with extreme dim so fzf can match it but users never see it.
+    Uses FTS5 for fast full-text filtering when a query is present.
     """
     if sort_by == "created":
         ordered_sessions = sorted(sessions, key=lambda s: s["created"], reverse=True)
     else:
         ordered_sessions = sorted(sessions, key=lambda s: s["modified"], reverse=True)
 
+    conn = open_search_cache()
+    ensure_search_cache(conn, ordered_sessions)
+
+    matching_paths = search_sessions(conn, query, scope) if query.strip() else None
+
     lines = []
     for s in ordered_sessions:
-        messages = parse_transcript(s["filepath"], max_bytes=MAX_READ_BYTES)
+        filepath = s["filepath"]
 
-        if scope == "user":
-            filtered = [(r, t) for r, t in messages if r == "user"]
-        elif scope == "assistant":
-            filtered = [(r, t) for r, t in messages if r == "assistant"]
-        else:
-            filtered = messages
+        if matching_paths is not None and filepath not in matching_paths:
+            continue
+
+        meta = conn.execute(
+            "SELECT msg_count, summary FROM transcript_meta WHERE filepath = ?",
+            (filepath,),
+        ).fetchone()
+        if not meta:
+            continue
 
         modified_str = s["modified"].strftime("%Y-%m-%d %H:%M")
         created_str = s["created"].strftime("%m-%d %H:%M")
-        summary = make_summary(messages)
+        summary = meta["summary"]
+        msg_count = meta["msg_count"]
 
-        searchable = " ".join(strip_tags(t).replace("\n", " ") for _, t in filtered)
-        if not ordered_tokens_match(searchable, query):
-            continue
+        searchable = get_searchable_text(conn, filepath, scope) if query.strip() else ""
+        excerpt = make_search_excerpt(searchable, query) if query.strip() else ""
 
-        msg_count = len(messages)
         hl_project = highlight_matches(s['project'], query, CYAN + BOLD) if query else s['project']
         hl_summary = highlight_matches(summary, query, DIM) if query else summary
+        hl_excerpt = highlight_matches(excerpt, query, DIM) if query else excerpt
+
+        excerpt_line = f"\n  {GRAY}{DIM}{hl_excerpt}{RESET}" if excerpt else ""
         card = (
             f"{CYAN}{BOLD}{hl_project}{RESET}"
             f"  {GRAY}({msg_count}){RESET}"
             f"  {DIM}{modified_str}{RESET}"
             f"  {GRAY}cre {created_str}{RESET}\n"
             f"  {DIM}{hl_summary}{RESET}"
-            f" {GRAY}{DIM}{searchable}{RESET}"
+            f"{excerpt_line}"
         )
 
         lines.append(f"{s['filepath']}\t{card}")
 
+    conn.close()
     return lines
 
 
@@ -344,8 +553,6 @@ def preview_session(filepath, reverse=False, query="", latest_match=False):
         text = strip_tags(text)
         if not text:
             continue
-        if role == "assistant" and len(text) > 400:
-            text = text[:397] + "..."
         wrapped = textwrap.fill(text, width=72)
         if role == "user":
             msg_lines.append(f"\n{GREEN}{BOLD}USER{RESET}\n{wrapped}")
@@ -358,39 +565,286 @@ def preview_session(filepath, reverse=False, query="", latest_match=False):
 
 # * HTML export
 
+# ** Markdown to HTML converter
+
+_MD_FENCED_CODE_RE = re.compile(
+    r"^```(\w*)\n(.*?)^```\s*$", re.MULTILINE | re.DOTALL
+)
+_MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_MD_HEADING_RE = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
+_MD_HR_RE = re.compile(r"^---+\s*$", re.MULTILINE)
+
+
+def _md_to_html(text):
+    """Convert markdown-formatted text to HTML for the export view.
+
+    Handles fenced code blocks, inline code, bold, italic, links,
+    headings, horizontal rules, and list items. Escapes HTML first
+    to prevent injection, then applies formatting patterns.
+    """
+    code_blocks = {}
+    counter = [0]
+
+    def _stash_code(m):
+        key = f"\x00CODE{counter[0]}\x00"
+        counter[0] += 1
+        lang = m.group(1) or ""
+        body = html_mod.escape(m.group(2).rstrip("\n"))
+        lang_attr = f' data-lang="{html_mod.escape(lang)}"' if lang else ""
+        code_blocks[key] = f'<pre class="code-block"><code{lang_attr}>{body}</code></pre>'
+        return key
+
+    text = _MD_FENCED_CODE_RE.sub(_stash_code, text)
+
+    inline_codes = {}
+
+    def _stash_inline(m):
+        key = f"\x00IC{counter[0]}\x00"
+        counter[0] += 1
+        inline_codes[key] = f'<code>{html_mod.escape(m.group(1))}</code>'
+        return key
+
+    text = _MD_INLINE_CODE_RE.sub(_stash_inline, text)
+
+    text = html_mod.escape(text)
+
+    for key, replacement in code_blocks.items():
+        text = text.replace(html_mod.escape(key), replacement)
+    for key, replacement in inline_codes.items():
+        text = text.replace(html_mod.escape(key), replacement)
+
+    text = _MD_BOLD_RE.sub(lambda m: f'<strong>{m.group(1) or m.group(2)}</strong>', text)
+    text = _MD_ITALIC_RE.sub(lambda m: f'<em>{m.group(1) or m.group(2)}</em>', text)
+    text = _MD_LINK_RE.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
+
+    def _heading_repl(m):
+        level = min(len(m.group(1)) + 2, 6)
+        return f'<h{level} class="msg-heading">{m.group(2)}</h{level}>'
+
+    text = _MD_HEADING_RE.sub(_heading_repl, text)
+    text = _MD_HR_RE.sub('<hr class="msg-hr">', text)
+
+    out_lines = []
+    in_list = False
+    for line in text.split("\n"):
+        stripped = line.strip()
+        is_li = re.match(r"^[-*]\s+", stripped) or re.match(r"^\d+\.\s+", stripped)
+        if is_li:
+            if not in_list:
+                out_lines.append("<ul>")
+                in_list = True
+            li_text = re.sub(r"^[-*]\s+|^\d+\.\s+", "", stripped)
+            out_lines.append(f"<li>{li_text}</li>")
+        else:
+            if in_list:
+                out_lines.append("</ul>")
+                in_list = False
+            out_lines.append(line)
+    if in_list:
+        out_lines.append("</ul>")
+    text = "\n".join(out_lines)
+
+    paragraphs = re.split(r"\n{2,}", text)
+    processed = []
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        if re.match(r"<(?:pre|h[1-6]|hr|ul|ol)", p):
+            processed.append(p)
+        else:
+            processed.append(f"<p>{p}</p>")
+    return "\n".join(processed)
+
+
+# ** HTML template (Tufte-inspired)
+
 HTML_TEMPLATE = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cursor Session — {project} — {modified}</title>
 <style>
-  :root {{ --bg: #1e1e2e; --fg: #cdd6f4; --user-bg: #1e3a2e; --asst-bg: #1e2a3e;
-           --user-label: #a6e3a1; --asst-label: #89b4fa; --meta: #6c7086; --border: #313244; }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 14px;
-          background: var(--bg); color: var(--fg); line-height: 1.6; padding: 0; }}
-  .header {{ background: #11111b; padding: 20px 24px; border-bottom: 1px solid var(--border); }}
-  .header h1 {{ font-size: 18px; color: #cba6f7; margin-bottom: 8px; }}
-  .header .meta {{ color: var(--meta); font-size: 13px; }}
-  .messages {{ max-width: 900px; margin: 0 auto; padding: 16px; }}
-  .msg {{ padding: 12px 16px; margin: 8px 0; border-radius: 8px; white-space: pre-wrap;
-          word-wrap: break-word; }}
-  .msg.user {{ background: var(--user-bg); border-left: 3px solid var(--user-label); }}
-  .msg.asst {{ background: var(--asst-bg); border-left: 3px solid var(--asst-label); }}
-  .role {{ font-weight: 700; font-size: 12px; text-transform: uppercase; margin-bottom: 6px; }}
-  .msg.user .role {{ color: var(--user-label); }}
-  .msg.asst .role {{ color: var(--asst-label); }}
+  @import url('https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {{
+    --bg: #fffff8;
+    --fg: #111;
+    --fg-secondary: #555;
+    --fg-muted: #888;
+    --user-accent: #2d6a4f;
+    --asst-accent: #3a5a8c;
+    --border: #ddd;
+    --code-bg: #f5f5f0;
+    --user-bg: rgba(45, 106, 79, 0.04);
+    --asst-bg: rgba(58, 90, 140, 0.04);
+  }}
+
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  body {{
+    font-family: 'Crimson Pro', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+    font-size: 19px;
+    line-height: 1.7;
+    color: var(--fg);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }}
+
+  /* -- Header -- */
+  .header {{
+    max-width: 740px;
+    margin: 0 auto;
+    padding: 60px 20px 30px;
+    border-bottom: 1px solid var(--border);
+  }}
+  .header h1 {{
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.5px;
+    color: var(--fg);
+    margin-bottom: 8px;
+  }}
+  .header .meta {{
+    font-size: 14px;
+    color: var(--fg-muted);
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    letter-spacing: 0.02em;
+  }}
+
+  /* -- Message container -- */
+  .messages {{
+    max-width: 740px;
+    margin: 0 auto;
+    padding: 20px 20px 80px;
+  }}
+
+  /* -- Individual message -- */
+  .msg {{
+    margin: 28px 0;
+    padding: 0;
+  }}
+  .msg + .msg {{
+    border-top: 1px solid #eee;
+    padding-top: 28px;
+  }}
+
+  .role {{
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-bottom: 10px;
+  }}
+  .msg.user .role {{ color: var(--user-accent); }}
+  .msg.asst .role {{ color: var(--asst-accent); }}
+
+  .msg.user {{ background: var(--user-bg); padding: 20px 24px; border-radius: 4px; }}
+  .msg.asst {{ }}
+
   .msg .body {{ color: var(--fg); }}
+  .msg .body p {{ margin-bottom: 0.85em; }}
+  .msg .body p:last-child {{ margin-bottom: 0; }}
+
+  /* -- Typography inside messages -- */
+  .msg .body strong {{ font-weight: 600; }}
+  .msg .body em {{ font-style: italic; }}
+  .msg .body a {{ color: var(--asst-accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }}
+  .msg .body a:hover {{ color: var(--fg); }}
+
+  .msg .body code {{
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    font-size: 0.82em;
+    background: var(--code-bg);
+    padding: 2px 5px;
+    border-radius: 3px;
+    color: #333;
+  }}
+
+  .msg .body pre.code-block {{
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    font-size: 0.78em;
+    line-height: 1.55;
+    background: var(--code-bg);
+    border: 1px solid #e8e8e0;
+    border-radius: 4px;
+    padding: 16px 20px;
+    margin: 16px 0;
+    overflow-x: auto;
+    white-space: pre;
+  }}
+  .msg .body pre.code-block code {{
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+  }}
+
+  .msg .body .msg-heading {{
+    font-family: 'Crimson Pro', Georgia, serif;
+    color: var(--fg);
+    margin: 20px 0 8px;
+    line-height: 1.3;
+  }}
+  h3.msg-heading {{ font-size: 1.15em; font-weight: 600; }}
+  h4.msg-heading {{ font-size: 1.05em; font-weight: 600; }}
+  h5.msg-heading {{ font-size: 0.95em; font-weight: 600; color: var(--fg-secondary); }}
+  h6.msg-heading {{ font-size: 0.88em; font-weight: 600; color: var(--fg-muted); }}
+
+  .msg .body ul, .msg .body ol {{
+    padding-left: 1.4em;
+    margin: 10px 0;
+  }}
+  .msg .body li {{
+    margin-bottom: 4px;
+  }}
+  .msg .body .msg-hr {{
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 20px 0;
+  }}
+
+  /* -- Footer -- */
+  .footer {{
+    max-width: 740px;
+    margin: 0 auto;
+    padding: 20px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--fg-muted);
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    text-align: center;
+  }}
+
+  @media (max-width: 800px) {{
+    body {{ font-size: 17px; }}
+    .header, .messages, .footer {{ padding-left: 16px; padding-right: 16px; }}
+    .header {{ padding-top: 30px; }}
+  }}
+
+  @media print {{
+    body {{ font-size: 12pt; }}
+    .header {{ padding-top: 0; }}
+    .msg.user {{ background: #f8f8f4; }}
+  }}
 </style>
 </head>
 <body>
 <div class="header">
   <h1>{project}</h1>
-  <div class="meta">Created: {created} &nbsp;|&nbsp; Modified: {modified} &nbsp;|&nbsp; Messages: {count}</div>
+  <div class="meta">{created} &rarr; {modified} &middot; {count} messages</div>
 </div>
 <div class="messages">
 {messages_html}
+</div>
+<div class="footer">
+  cursearch export
 </div>
 </body>
 </html>
@@ -411,11 +865,11 @@ def export_html(filepath):
             continue
         css_class = "user" if role == "user" else "asst"
         label = "USER" if role == "user" else "ASSISTANT"
-        escaped = html_mod.escape(text)
+        body_html = _md_to_html(text)
         msg_blocks.append(
             f'<div class="msg {css_class}">'
             f'<div class="role">{label}</div>'
-            f'<div class="body">{escaped}</div>'
+            f'<div class="body">{body_html}</div>'
             f'</div>'
         )
 
@@ -443,12 +897,24 @@ def make_heading_text(text, max_len=100):
     return line
 
 
+def normalize_export_messages(messages):
+    """Return chronological, cleaned transcript messages for export."""
+    normalized = []
+    for idx, (role, text) in enumerate(messages, start=1):
+        text = strip_tags(text)
+        if not text:
+            continue
+        normalized.append((idx, role, text))
+    return normalized
+
+
 def export_org(filepath):
     """Export a session transcript to Org-mode and open in Emacs/default editor."""
     messages = parse_transcript(filepath)
     project_dir = Path(filepath).parent.parent.name
     project = short_project_name(project_dir)
     created, modified = get_file_times(filepath)
+    export_messages = normalize_export_messages(messages)
 
     lines = [
         f"#+title: Cursor Session — {project}",
@@ -458,24 +924,15 @@ def export_org(filepath):
         f"- *Project:* {project}",
         f"- *Created:* [{created.strftime('%Y-%m-%d %a %H:%M')}]",
         f"- *Modified:* [{modified.strftime('%Y-%m-%d %a %H:%M')}]",
-        f"- *Messages:* {len(messages)}",
+        f"- *Messages:* {len(export_messages)}",
         "",
     ]
 
-    for role, text in messages:
-        text = strip_tags(text)
-        if not text:
-            continue
-        if role == "user":
-            heading = make_heading_text(text)
-            lines.append(f"* {heading}")
-            if text.strip() != heading.rstrip("..."):
-                lines.append("")
-                lines.append(text)
-        else:
-            lines.append(f"** Assistant")
-            lines.append("")
-            lines.append(text)
+    for idx, role, text in export_messages:
+        label = "User" if role == "user" else "Assistant"
+        lines.append(f"* {idx:03d} {label}")
+        lines.append("")
+        lines.append(text)
         lines.append("")
 
     fd, tmp_path = tempfile.mkstemp(suffix=".org", prefix="cursearch_")
@@ -492,6 +949,7 @@ def export_markdown(filepath):
     project_dir = Path(filepath).parent.parent.name
     project = short_project_name(project_dir)
     created, modified = get_file_times(filepath)
+    export_messages = normalize_export_messages(messages)
 
     lines = [
         f"# Cursor Session — {project}",
@@ -499,25 +957,17 @@ def export_markdown(filepath):
         f"- **Project:** {project}",
         f"- **Created:** {created.strftime('%Y-%m-%d %H:%M')}",
         f"- **Modified:** {modified.strftime('%Y-%m-%d %H:%M')}",
-        f"- **Messages:** {len(messages)}",
+        f"- **Messages:** {len(export_messages)}",
         "",
         "---",
         "",
     ]
 
-    for role, text in messages:
-        text = strip_tags(text)
-        if not text:
-            continue
-        if role == "user":
-            heading = make_heading_text(text)
-            lines.append(f"## {heading}")
-            lines.append("")
-            lines.append(text)
-        else:
-            lines.append("### Assistant")
-            lines.append("")
-            lines.append(text)
+    for idx, role, text in export_messages:
+        label = "User" if role == "user" else "Assistant"
+        lines.append(f"## {idx:03d} {label}")
+        lines.append("")
+        lines.append(text)
         lines.append("")
 
     fd, tmp_path = tempfile.mkstemp(suffix=".md", prefix="cursearch_")
