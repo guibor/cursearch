@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """cursearch — fuzzy search through Cursor CLI agent transcripts."""
 
+import hashlib
 import html as html_mod
 import json
 import os
@@ -13,15 +14,20 @@ import textwrap
 import webbrowser
 from collections import Counter
 from datetime import datetime
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # * Configuration
 
 CURSOR_PROJECTS_DIR = Path.home() / ".cursor" / "projects"
+CURSOR_CLI_CHATS_DIR = Path.home() / ".config" / "cursor" / "chats"
 HOME_PREFIX = str(Path.home()).lstrip("/").replace("/", "-") + "-"
 MAX_SUMMARY_QUERIES = 5
 SEARCH_CACHE_DB = Path(tempfile.gettempdir()) / "cursearch_search_cache.sqlite3"
 SEARCH_EXCERPT_CHARS = 180
+SESSION_CATALOG_FINGERPRINT_KEY = "session_catalog_fingerprint_v3"
+SESSION_CATALOG_REFRESH_FLAG = "--refresh-cache"
 
 # * ANSI colors
 
@@ -93,6 +99,92 @@ def parse_transcript(filepath, max_bytes=None):
     return []
 
 
+def _extract_text_fields(value):
+    """Extract searchable text from nested Cursor chat JSON values."""
+    parts = []
+    if value is None:
+        return parts
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            parts.append(text)
+        return parts
+    if isinstance(value, (int, float, bool)):
+        return parts
+    if isinstance(value, dict):
+        for key in ("text", "result", "content"):
+            if key in value:
+                parts.extend(_extract_text_fields(value.get(key)))
+        if "args" in value:
+            try:
+                args_text = json.dumps(value["args"], ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                args_text = str(value["args"])
+            if args_text.strip():
+                parts.append(args_text.strip())
+        if "experimental_content" in value:
+            parts.extend(_extract_text_fields(value.get("experimental_content")))
+        return parts
+    if isinstance(value, list):
+        for item in value:
+            parts.extend(_extract_text_fields(item))
+        return parts
+    text = str(value).strip()
+    if text:
+        parts.append(text)
+    return parts
+
+
+def parse_cursor_store(filepath):
+    """Parse Cursor's hidden chat store.db into (role, text) tuples."""
+    messages = []
+    conn = sqlite3.connect(str(filepath))
+    try:
+        for _, _, raw in conn.execute("SELECT rowid, id, data FROM blobs ORDER BY rowid"):
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+
+            if isinstance(obj, dict) and "role" in obj and "content" in obj:
+                items = [obj]
+            elif isinstance(obj, list):
+                items = [item for item in obj if isinstance(item, dict) and "role" in item and "content" in item]
+            else:
+                continue
+
+            for item in items:
+                role = item.get("role", "unknown")
+                content = item.get("content", [])
+                text_parts = _extract_text_fields(content)
+                text = " ".join(text_parts).strip()
+                if text:
+                    messages.append((role, text))
+    finally:
+        conn.close()
+    return messages
+
+
+def parse_session_messages(filepath):
+    """Parse either an exported transcript or a Cursor chat store."""
+    filepath = Path(filepath)
+    if filepath.name == "store.db":
+        return parse_cursor_store(filepath)
+    return parse_transcript(filepath)
+
+
+def extract_workspace_path(messages):
+    """Extract the workspace path from Cursor's injected user_info block."""
+    for _, text in messages[:3]:
+        match = re.search(r"Workspace Path:\s*(.+)", text)
+        if match:
+            value = match.group(1).strip()
+            value = value.split("</", 1)[0].strip()
+            value = value.split("\n", 1)[0].strip()
+            return value or None
+    return None
+
+
 # * XML/tag stripping
 
 NOISE_TAGS_RE = re.compile(
@@ -141,45 +233,222 @@ def short_project_name(dirname):
     return dirname
 
 
-def scan_all_transcripts():
-    """Walk all Cursor project dirs and collect transcript metadata."""
+def _cursor_store_record(store_db):
+    """Build a session record from Cursor's hidden store.db."""
+    store_db = Path(store_db)
+    stat = store_db.stat()
+    conn = sqlite3.connect(str(store_db))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = '0'").fetchone()
+        if not row:
+            return None
+        meta = json.loads(bytes.fromhex(row["value"]).decode())
+        session_id = meta.get("agentId") or store_db.parent.name
+        if not session_id:
+            return None
+        created_at = meta.get("createdAt")
+        created = (
+            datetime.fromtimestamp(created_at / 1000.0)
+            if isinstance(created_at, (int, float))
+            else datetime.fromtimestamp(stat.st_ctime)
+        )
+        project = meta.get("name") or store_db.parent.parent.name
+        return {
+            "project": project,
+            "filepath": str(store_db),
+            "session_id": session_id,
+            "created": created,
+            "modified": datetime.fromtimestamp(stat.st_mtime),
+            "format": ".store.db",
+            "source": "cursor_store",
+            "workspace_path": "",
+            "session_name": meta.get("name") or "",
+            "workspace_hash": store_db.parent.parent.name,
+        }
+    finally:
+        conn.close()
+
+
+def _session_discovery_fingerprint():
+    """Fingerprint the visible Cursor session sources for cache invalidation."""
+    payload = {
+        "projects": [],
+    }
+
+    if CURSOR_PROJECTS_DIR.is_dir():
+        for project_dir in sorted(CURSOR_PROJECTS_DIR.iterdir()):
+            transcripts_dir = project_dir / "agent-transcripts"
+            if not transcripts_dir.is_dir():
+                continue
+            stat = transcripts_dir.stat()
+            payload["projects"].append(
+                [project_dir.name, stat.st_mtime_ns, stat.st_size]
+            )
+
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _record_for_cache(record):
+    """Convert a session record into JSON-safe cached data."""
+    cached = dict(record)
+    for key in ("created", "modified"):
+        value = cached.pop(key, None)
+        if isinstance(value, datetime):
+            cached[f"{key}_ts"] = value.timestamp()
+    return cached
+
+
+def _record_from_cache(cached):
+    """Rehydrate a cached session record into runtime form."""
+    record = dict(cached)
+    created_ts = record.pop("created_ts", None)
+    modified_ts = record.pop("modified_ts", None)
+    if created_ts is not None:
+        record["created"] = datetime.fromtimestamp(created_ts)
+    if modified_ts is not None:
+        record["modified"] = datetime.fromtimestamp(modified_ts)
+    return record
+
+
+def _load_session_catalog(conn, fingerprint):
+    """Load the cached session catalog if the fingerprint matches."""
+    row = conn.execute(
+        "SELECT value FROM session_catalog_meta WHERE key = ?",
+        (SESSION_CATALOG_FINGERPRINT_KEY,),
+    ).fetchone()
+    if not row or row["value"] != fingerprint:
+        return None
+
+    rows = conn.execute(
+        "SELECT record_json FROM session_catalog ORDER BY modified_ts DESC, filepath ASC"
+    ).fetchall()
+    return [_record_from_cache(json.loads(row["record_json"])) for row in rows]
+
+
+def _load_any_session_catalog(conn):
+    """Load any cached session catalog, even if stale."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_catalog'"
+    ).fetchone()
+    if not exists:
+        return None
+    rows = conn.execute(
+        "SELECT record_json FROM session_catalog ORDER BY modified_ts DESC, filepath ASC"
+    ).fetchall()
+    if not rows:
+        return None
+    return [_record_from_cache(json.loads(row["record_json"])) for row in rows]
+
+
+def _save_session_catalog(conn, fingerprint, sessions):
+    """Persist the session catalog for fast startup."""
+    conn.execute("DELETE FROM session_catalog")
+    conn.execute(
+        "INSERT OR REPLACE INTO session_catalog_meta (key, value) VALUES (?, ?)",
+        (SESSION_CATALOG_FINGERPRINT_KEY, fingerprint),
+    )
+    for s in sessions:
+        cached = _record_for_cache(s)
+        conn.execute(
+            "INSERT OR REPLACE INTO session_catalog (filepath, modified_ts, record_json) VALUES (?, ?, ?)",
+            (
+                s["filepath"],
+                cached.get("modified_ts", 0.0),
+                json.dumps(cached, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+
+
+def _spawn_catalog_refresh():
+    """Refresh the session catalog in a background process."""
+    cmd = [sys.executable, os.path.abspath(__file__), SESSION_CATALOG_REFRESH_FLAG]
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def _scan_project_transcripts(project_dir):
+    """Scan one Cursor project directory for transcript files."""
+    transcripts_dir = project_dir / "agent-transcripts"
+    if not transcripts_dir.is_dir():
+        return []
+
+    project_name = short_project_name(project_dir.name)
+    workspace_path = decode_project_path(project_dir.name)
     sessions = []
-    seen_ids = {}
+    seen_ids = set()
 
-    if not CURSOR_PROJECTS_DIR.is_dir():
-        return sessions
-
-    for project_dir in sorted(CURSOR_PROJECTS_DIR.iterdir()):
-        transcripts_dir = project_dir / "agent-transcripts"
-        if not transcripts_dir.is_dir():
+    for fpath in sorted(transcripts_dir.iterdir()):
+        if fpath.suffix not in (".jsonl", ".txt"):
             continue
 
-        project_name = short_project_name(project_dir.name)
+        session_id = fpath.stem
+        if session_id in seen_ids:
+            if fpath.suffix == ".jsonl":
+                for session in sessions:
+                    if session["session_id"] == session_id:
+                        session["filepath"] = str(fpath)
+                        session["format"] = fpath.suffix
+                        break
+            continue
 
-        for fpath in sorted(transcripts_dir.iterdir()):
-            if fpath.suffix not in (".jsonl", ".txt"):
-                continue
-
-            session_id = fpath.stem
-
-            if session_id in seen_ids:
-                if fpath.suffix == ".jsonl":
-                    sessions[seen_ids[session_id]]["filepath"] = str(fpath)
-                    sessions[seen_ids[session_id]]["format"] = fpath.suffix
-                continue
-
-            created, modified = get_file_times(fpath)
-            seen_ids[session_id] = len(sessions)
-            sessions.append({
+        created, modified = get_file_times(fpath)
+        seen_ids.add(session_id)
+        sessions.append(
+            {
                 "project": project_name,
                 "filepath": str(fpath),
                 "session_id": session_id,
                 "created": created,
                 "modified": modified,
                 "format": fpath.suffix,
-            })
+                "source": "transcript",
+                "workspace_path": workspace_path,
+                "msg_count": 0,
+                "summary": "",
+                "searchable_all": "",
+                "searchable_user": "",
+                "searchable_assistant": "",
+            }
+        )
+
+    return sessions
+
+
+def scan_all_transcripts():
+    """Walk all Cursor session sources and collect transcript metadata."""
+    conn = open_search_cache()
+    fingerprint = _session_discovery_fingerprint()
+    cached = _load_session_catalog(conn, fingerprint)
+    if cached is None:
+        cached = _load_any_session_catalog(conn)
+    if cached is not None:
+        conn.close()
+        return cached
+
+    sessions = []
+
+    if not CURSOR_PROJECTS_DIR.is_dir():
+        conn.close()
+        return sessions
+
+    project_dirs = [p for p in sorted(CURSOR_PROJECTS_DIR.iterdir()) if (p / "agent-transcripts").is_dir()]
+    if project_dirs:
+        workers = min(8, len(project_dirs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for chunk in pool.map(_scan_project_transcripts, project_dirs):
+                sessions.extend(chunk)
 
     sessions.sort(key=lambda s: s["modified"], reverse=True)
+    _save_session_catalog(conn, fingerprint, sessions)
+    conn.commit()
+    conn.close()
     return sessions
 
 
@@ -254,17 +523,17 @@ def highlight_matches(text, query, restore=""):
 
 
 def make_search_excerpt(text, query="", max_chars=SEARCH_EXCERPT_CHARS):
-    """Return a short contextual excerpt for display in the search UI."""
+    """Return a short contextual excerpt centered on the best token cluster."""
     text = text.replace("\n", " ").strip()
     if not text:
         return "(no transcript text)"
 
-    start = 0
     tokens = parse_query_tokens(query)
+    start = 0
     if tokens:
-        idx = token_contains(text, tokens[0])
-        if idx >= 0:
-            start = max(0, idx - max_chars // 3)
+        best = _find_token_cluster(text, tokens)
+        if best >= 0:
+            start = max(0, best - max_chars // 3)
 
     excerpt = text[start:start + max_chars].strip()
     if start > 0:
@@ -274,33 +543,82 @@ def make_search_excerpt(text, query="", max_chars=SEARCH_EXCERPT_CHARS):
     return excerpt
 
 
-def open_search_cache():
-    """Open the persistent SQLite FTS5 search cache.
+def _find_token_cluster(text, tokens):
+    """Find the position where the most query tokens appear close together.
 
-    Schema: a metadata table for cache invalidation plus an FTS5
-    virtual table for fast full-text matching.
+    Returns the index of the first token in the best cluster, or -1.
     """
+    if not tokens:
+        return -1
+    lower = text.lower()
+    lower_tokens = [t.lower() for t in tokens]
+
+    if len(tokens) == 1:
+        return lower.find(lower_tokens[0])
+
+    # Find all occurrences of each token, pick the window where
+    # the most tokens appear closest together.
+    best_pos = -1
+    best_span = float("inf")
+    positions = []
+    for lt in lower_tokens:
+        idx = lower.find(lt)
+        if idx >= 0:
+            positions.append(idx)
+    if not positions:
+        return -1
+    if len(positions) == 1:
+        return positions[0]
+
+    # Use the earliest token position as anchor, look for others nearby
+    positions.sort()
+    best_pos = positions[0]
+    best_span = positions[-1] - positions[0]
+
+    # Slide through text looking for tighter clusters
+    for lt in lower_tokens:
+        idx = 0
+        while True:
+            idx = lower.find(lt, idx)
+            if idx < 0:
+                break
+            window_start = max(0, idx - 200)
+            window_end = idx + 200
+            found = []
+            for lt2 in lower_tokens:
+                p = lower.find(lt2, window_start)
+                if 0 <= p < window_end:
+                    found.append(p)
+            if len(found) >= len(positions):
+                span = max(found) - min(found)
+                if span < best_span:
+                    best_span = span
+                    best_pos = min(found)
+            idx += 1
+            if idx > len(lower):
+                break
+
+    return best_pos
+
+
+def open_search_cache():
+    """Open the persistent SQLite cache used for session discovery."""
     conn = sqlite3.connect(str(SEARCH_CACHE_DB))
     conn.row_factory = sqlite3.Row
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS transcript_meta (
-            filepath TEXT PRIMARY KEY,
-            mtime_ns INTEGER NOT NULL,
-            size_bytes INTEGER NOT NULL,
-            msg_count INTEGER NOT NULL,
-            summary TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS session_catalog_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )
         """
     )
     conn.execute(
         """
-        CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
-            filepath UNINDEXED,
-            searchable_all,
-            searchable_user,
-            searchable_assistant,
-            tokenize = 'unicode61 remove_diacritics 2 tokenchars _'
+        CREATE TABLE IF NOT EXISTS session_catalog (
+            filepath TEXT PRIMARY KEY,
+            modified_ts REAL NOT NULL,
+            record_json TEXT NOT NULL
         )
         """
     )
@@ -308,8 +626,9 @@ def open_search_cache():
 
 
 def build_session_search_record(filepath):
-    """Build full-text search fields for a transcript file."""
-    messages = parse_transcript(filepath)
+    """Build full-text search fields for a transcript or Cursor chat store."""
+    messages = parse_session_messages(filepath)
+    workspace_path = extract_workspace_path(messages)
     cleaned_messages = []
     for role, text in messages:
         text = strip_tags(text)
@@ -328,6 +647,8 @@ def build_session_search_record(filepath):
         "searchable_all": searchable_all,
         "searchable_user": searchable_user,
         "searchable_assistant": searchable_assistant,
+        "workspace_path": workspace_path or "",
+        "source": "cursor_store" if Path(filepath).name == "store.db" else "transcript",
     }
 
 
@@ -368,16 +689,27 @@ def ensure_search_cache(conn, sessions):
 
         conn.execute(
             """
-            INSERT INTO transcript_meta (filepath, mtime_ns, size_bytes, msg_count, summary)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO transcript_meta (
+                filepath, mtime_ns, size_bytes, msg_count, summary, workspace_path, source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(filepath) DO UPDATE SET
                 mtime_ns = excluded.mtime_ns,
                 size_bytes = excluded.size_bytes,
                 msg_count = excluded.msg_count,
-                summary = excluded.summary
+                summary = excluded.summary,
+                workspace_path = excluded.workspace_path,
+                source = excluded.source
             """,
-            (filepath, stat.st_mtime_ns, stat.st_size,
-             record["msg_count"], record["summary"]),
+            (
+                filepath,
+                stat.st_mtime_ns,
+                stat.st_size,
+                record["msg_count"],
+                record["summary"],
+                record.get("workspace_path", ""),
+                record.get("source", ""),
+            ),
         )
         conn.execute(
             "INSERT INTO transcript_fts (filepath, searchable_all, "
@@ -401,17 +733,20 @@ def ensure_search_cache(conn, sessions):
 def _build_fts_query(query):
     """Translate a user query string into an FTS5 MATCH expression.
 
-    Each whitespace-separated token becomes an FTS5 prefix token (tok*),
-    and they are ANDed together so all tokens must appear.
+    Single token  -> prefix match: "tok" *
+    Multi token   -> NEAR so tokens must appear within 50 words of each other,
+                     eliminating false positives from unrelated mentions.
     """
     tokens = parse_query_tokens(query)
     if not tokens:
         return None
-    fts_tokens = []
+    fts_parts = []
     for tok in tokens:
         safe = tok.replace('"', '""')
-        fts_tokens.append(f'"{safe}" *')
-    return " AND ".join(fts_tokens)
+        fts_parts.append(f'"{safe}" *')
+    if len(fts_parts) == 1:
+        return fts_parts[0]
+    return f"NEAR({' '.join(fts_parts)}, 50)"
 
 
 def _fts_scope_column(scope):
@@ -423,31 +758,107 @@ def _fts_scope_column(scope):
     return "searchable_all"
 
 
-def search_sessions(conn, query, scope="all"):
-    """Search sessions using FTS5. Returns set of matching filepaths."""
-    fts_expr = _build_fts_query(query)
-    if fts_expr is None:
+def _score_query_text(text, query, tokens):
+    """Score how well text matches a query.
+
+    The goal is to prefer sessions that contain more query tokens and to
+    rank exact or near-exact matches higher, without hiding sessions that
+    mention only part of the query.
+    """
+    if not tokens:
+        return 0
+
+    haystack = text or ""
+    score = 0
+
+    # Exact query phrase, case-insensitive, is the strongest signal.
+    normalized_query = query.strip().lower()
+    if normalized_query and normalized_query in haystack.lower():
+        score += 500
+
+    matched_tokens = 0
+    for token in tokens:
+        if token_contains(haystack, token) >= 0:
+            matched_tokens += 1
+
+    if matched_tokens == 0:
+        return 0
+
+    score += matched_tokens * 100
+    if matched_tokens == len(tokens):
+        score += 150
+
+    cluster = _find_token_cluster(haystack, tokens)
+    if cluster >= 0:
+        score += 50
+
+    return score
+
+
+def search_sessions(sessions, query, scope="all"):
+    """Score sessions against a query using cached session text."""
+    tokens = parse_query_tokens(query)
+    if not tokens:
         return None
 
+    have_cached_searchables = any(
+        row.get("searchable_all") or row.get("searchable_user") or row.get("searchable_assistant")
+        for row in sessions
+    )
+    scores = {}
     col = _fts_scope_column(scope)
-    try:
-        rows = conn.execute(
-            f"SELECT filepath FROM transcript_fts WHERE {col} MATCH ?",
-            (fts_expr,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return set()
-    return {row["filepath"] for row in rows}
+    if have_cached_searchables:
+        for row in sessions:
+            searchable = f"{row.get('summary', '')}\n{row.get(col, '')}"
+            score = _score_query_text(searchable, query, tokens)
+            if score > 0:
+                scores[row["filepath"]] = score
+    else:
+        for row in sessions:
+            record = build_session_search_record(row["filepath"])
+            searchable = f"{record.get('summary', '')}\n{record.get(col, '')}"
+            score = _score_query_text(searchable, query, tokens)
+            if score > 0:
+                scores[row["filepath"]] = score
+    return scores
 
 
-def get_searchable_text(conn, filepath, scope="all"):
+def get_searchable_text(sessions, filepath, scope="all"):
     """Retrieve the cached searchable text for a session."""
     col = _fts_scope_column(scope)
-    row = conn.execute(
-        f"SELECT {col} FROM transcript_fts WHERE filepath = ?",
-        (filepath,),
-    ).fetchone()
-    return row[col] if row else ""
+    for row in sessions:
+        if row["filepath"] == filepath:
+            return row.get(col, "")
+    return ""
+
+
+def _scan_cursor_store_sessions():
+    """Discover Cursor hidden store.db sessions on demand."""
+    sessions = []
+    if not CURSOR_CLI_CHATS_DIR.is_dir():
+        return sessions
+
+    for store_db in sorted(CURSOR_CLI_CHATS_DIR.glob("**/store.db")):
+        record = _cursor_store_record(store_db)
+        if not record:
+            continue
+        search_record = build_session_search_record(store_db)
+        record.update(
+            {
+                "msg_count": search_record["msg_count"],
+                "summary": search_record["summary"],
+                "searchable_all": search_record["searchable_all"],
+                "searchable_user": search_record["searchable_user"],
+                "searchable_assistant": search_record["searchable_assistant"],
+                "workspace_path": search_record.get("workspace_path", ""),
+                "source": "cursor_store",
+            }
+        )
+        workspace_path = record.get("workspace_path", "")
+        if workspace_path:
+            record["project"] = Path(workspace_path).name or record["project"]
+        sessions.append(record)
+    return sessions
 
 
 def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
@@ -456,47 +867,62 @@ def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
     Each line is a single fzf entry with tab-separated fields:
       filepath \\t visible_card
 
-    Uses FTS5 for fast full-text filtering when a query is present.
+    Uses scored text matching against the cached transcript text when a
+    query is present.
     """
     if sort_by == "created":
         ordered_sessions = sorted(sessions, key=lambda s: s["created"], reverse=True)
     else:
         ordered_sessions = sorted(sessions, key=lambda s: s["modified"], reverse=True)
 
-    conn = open_search_cache()
-    ensure_search_cache(conn, ordered_sessions)
+    matching_scores = search_sessions(ordered_sessions, query, scope) if query.strip() else None
+    if query.strip() and not matching_scores:
+        store_sessions = _scan_cursor_store_sessions()
+        if store_sessions:
+            store_scores = search_sessions(store_sessions, query, scope)
+            if store_scores:
+                ordered_sessions = ordered_sessions + store_sessions
+                matching_scores = store_scores
 
-    matching_paths = search_sessions(conn, query, scope) if query.strip() else None
-
-    lines = []
+    ranked_sessions = []
     for s in ordered_sessions:
         filepath = s["filepath"]
 
-        if matching_paths is not None and filepath not in matching_paths:
-            continue
+        score = 0
+        if matching_scores is not None:
+            score = matching_scores.get(filepath, 0)
+            if score <= 0:
+                continue
 
-        meta = conn.execute(
-            "SELECT msg_count, summary FROM transcript_meta WHERE filepath = ?",
-            (filepath,),
-        ).fetchone()
-        if not meta:
-            continue
+        ranked_sessions.append((score, s))
 
+    if matching_scores is not None:
+        ranked_sessions.sort(
+            key=lambda item: (item[0], item[1]["modified"] if sort_by == "modified" else item[1]["created"]),
+            reverse=True,
+        )
+
+    lines = []
+    for score, s in ranked_sessions:
+        filepath = s["filepath"]
         modified_str = s["modified"].strftime("%Y-%m-%d %H:%M")
         created_str = s["created"].strftime("%m-%d %H:%M")
-        summary = meta["summary"]
-        msg_count = meta["msg_count"]
+        summary = s.get("summary") or s.get("session_id") or ""
+        msg_count = s.get("msg_count", 0)
+        workspace_path = s.get("workspace_path", "")
 
-        searchable = get_searchable_text(conn, filepath, scope) if query.strip() else ""
-        excerpt = make_search_excerpt(searchable, query) if query.strip() else ""
+        searchable = s.get(_fts_scope_column(scope), "")
+        excerpt = make_search_excerpt(f"{summary}\n{searchable}", query) if query.strip() else ""
 
         hl_project = highlight_matches(s['project'], query, CYAN + BOLD) if query else s['project']
         hl_summary = highlight_matches(summary, query, DIM) if query else summary
         hl_excerpt = highlight_matches(excerpt, query, DIM) if query else excerpt
 
+        score_str = f" {GRAY}[{score}]{RESET}" if query else ""
         excerpt_line = f"\n  {GRAY}{DIM}{hl_excerpt}{RESET}" if excerpt else ""
         card = (
             f"{CYAN}{BOLD}{hl_project}{RESET}"
+            f"{score_str}"
             f"  {GRAY}({msg_count}){RESET}"
             f"  {DIM}{modified_str}{RESET}"
             f"  {GRAY}cre {created_str}{RESET}\n"
@@ -504,9 +930,7 @@ def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
             f"{excerpt_line}"
         )
 
-        lines.append(f"{s['filepath']}\t{card}")
-
-    conn.close()
+        lines.append(f"{filepath}\t{card}")
     return lines
 
 
@@ -517,11 +941,44 @@ def join_lines(lines):
 
 # * Preview (called by fzf subprocess)
 
+def _find_best_message_match(messages, tokens):
+    """Find the last message containing the most query tokens.
+
+    Prefers messages where all tokens appear; falls back to the message
+    with the highest token count. Returns -1 if no token matches at all.
+    """
+    if not tokens:
+        return -1
+    lower_tokens = [t.lower() for t in tokens]
+    best_idx = -1
+    best_count = 0
+    for i, (_, text) in enumerate(messages):
+        lower_text = text.lower()
+        count = sum(1 for lt in lower_tokens if lt in lower_text)
+        if count > 0 and count >= best_count:
+            best_count = count
+            best_idx = i
+    return best_idx
+
+
 def preview_session(filepath, reverse=False, query="", latest_match=False):
     """Print a colored preview of a session transcript."""
-    messages = parse_transcript(filepath)
-    project_dir = Path(filepath).parent.parent.name
-    project = short_project_name(project_dir)
+    filepath = (filepath or "").strip()
+    if not filepath:
+        print(f"{YELLOW}[cursearch] No session selected yet.{RESET}")
+        return
+    if not os.path.exists(filepath):
+        print(f"{YELLOW}[cursearch] Session file not found: {filepath}{RESET}")
+        return
+
+    filepath_obj = Path(filepath)
+    messages = parse_session_messages(filepath)
+    if filepath_obj.name == "store.db":
+        store_record = _cursor_store_record(filepath_obj)
+        project = store_record["project"] if store_record else "cursor-store"
+    else:
+        project_dir = filepath_obj.parent.parent.name
+        project = short_project_name(project_dir)
     created, modified = get_file_times(filepath)
 
     header = (
@@ -534,26 +991,25 @@ def preview_session(filepath, reverse=False, query="", latest_match=False):
     display_msgs = list(reversed(messages)) if reverse else messages
 
     if latest_match and query.strip():
-        last_idx = -1
-        for i, (_, text) in enumerate(messages):
-            if ordered_tokens_match(text, query):
-                last_idx = i
+        tokens = parse_query_tokens(query)
+        last_idx = _find_best_message_match(messages, tokens)
         if last_idx >= 0:
             start = max(0, last_idx - 6)
             end = min(len(messages), last_idx + 8)
             display_msgs = messages[start:end]
         else:
-            msg = f"{YELLOW}[no match]{RESET} No message matches query: {query}"
-            print(header)
-            print(msg)
-            return
+            display_msgs = messages[-14:] if messages else []
 
     msg_lines = []
+    do_highlight = latest_match and query.strip()
     for role, text in display_msgs:
         text = strip_tags(text)
         if not text:
             continue
         wrapped = textwrap.fill(text, width=72)
+        if do_highlight:
+            restore = "" if role == "user" else DIM
+            wrapped = highlight_matches(wrapped, query, restore)
         if role == "user":
             msg_lines.append(f"\n{GREEN}{BOLD}USER{RESET}\n{wrapped}")
         else:
@@ -853,9 +1309,14 @@ HTML_TEMPLATE = """\
 
 def export_html(filepath):
     """Export a session transcript to HTML and open in browser."""
-    messages = parse_transcript(filepath)
-    project_dir = Path(filepath).parent.parent.name
-    project = short_project_name(project_dir)
+    filepath_obj = Path(filepath)
+    messages = parse_session_messages(filepath_obj)
+    if filepath_obj.name == "store.db":
+        store_record = _cursor_store_record(filepath_obj)
+        project = store_record["project"] if store_record else "cursor-store"
+    else:
+        project_dir = filepath_obj.parent.parent.name
+        project = short_project_name(project_dir)
     created, modified = get_file_times(filepath)
 
     msg_blocks = []
@@ -910,9 +1371,14 @@ def normalize_export_messages(messages):
 
 def export_org(filepath):
     """Export a session transcript to Org-mode and open in Emacs/default editor."""
-    messages = parse_transcript(filepath)
-    project_dir = Path(filepath).parent.parent.name
-    project = short_project_name(project_dir)
+    filepath_obj = Path(filepath)
+    messages = parse_session_messages(filepath_obj)
+    if filepath_obj.name == "store.db":
+        store_record = _cursor_store_record(filepath_obj)
+        project = store_record["project"] if store_record else "cursor-store"
+    else:
+        project_dir = filepath_obj.parent.parent.name
+        project = short_project_name(project_dir)
     created, modified = get_file_times(filepath)
     export_messages = normalize_export_messages(messages)
 
@@ -945,9 +1411,14 @@ def export_org(filepath):
 
 def export_markdown(filepath):
     """Export a session transcript to Markdown and open in default editor."""
-    messages = parse_transcript(filepath)
-    project_dir = Path(filepath).parent.parent.name
-    project = short_project_name(project_dir)
+    filepath_obj = Path(filepath)
+    messages = parse_session_messages(filepath_obj)
+    if filepath_obj.name == "store.db":
+        store_record = _cursor_store_record(filepath_obj)
+        project = store_record["project"] if store_record else "cursor-store"
+    else:
+        project_dir = filepath_obj.parent.parent.name
+        project = short_project_name(project_dir)
     created, modified = get_file_times(filepath)
     export_messages = normalize_export_messages(messages)
 
@@ -1020,6 +1491,7 @@ def print_help_overlay():
 
 # * Resume session
 
+@lru_cache(maxsize=None)
 def decode_project_path(dirname):
     """Decode a Cursor project directory name back to a real filesystem path.
 
@@ -1134,30 +1606,121 @@ def infer_resume_cwd(transcript_path, project_path):
     return best_dir
 
 
+def _session_is_resumable(session_id, workspace_path):
+    """Check if the CLI agent's internal blob store has data for this session.
+
+    The agent stores conversation state in
+    ~/.config/cursor/chats/<md5(workspace)>/<session_id>/store.db.
+    A session whose meta row has an empty latestRootBlobId will start
+    fresh instead of resuming — detect that here.
+    """
+    workspace_hash = hashlib.md5(workspace_path.encode()).hexdigest()
+    store_db = CURSOR_CLI_CHATS_DIR / workspace_hash / session_id / "store.db"
+    if not store_db.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(store_db))
+        row = conn.execute("SELECT value FROM meta WHERE key = '0'").fetchone()
+        conn.close()
+        if not row:
+            return False
+        meta = json.loads(bytes.fromhex(row[0]).decode())
+        return bool(meta.get("latestRootBlobId"))
+    except Exception:
+        return False
+
+
+def _build_continuation_prompt(filepath):
+    """Build a prompt that summarizes the old session for a fresh agent."""
+    messages = parse_session_messages(filepath)
+    if not messages:
+        return None
+    user_msgs = [(i, strip_tags(t)) for i, (r, t) in enumerate(messages) if r == "user" and strip_tags(t)]
+
+    parts = []
+    parts.append(
+        "I'm continuing a previous conversation whose internal state was lost. "
+        "Here is a summary of what we discussed so you have context:\n"
+    )
+
+    # Include the first user message (original request) and last few exchanges
+    if user_msgs:
+        first_text = user_msgs[0][1]
+        if len(first_text) > 500:
+            first_text = first_text[:500] + "..."
+        parts.append(f"**Original request:**\n{first_text}\n")
+
+    # Last 3 exchanges for recent context
+    last_messages = messages[-6:]
+    if last_messages:
+        parts.append("**Recent messages:**")
+        for role, text in last_messages:
+            text = strip_tags(text)
+            if not text:
+                continue
+            if len(text) > 400:
+                text = text[:400] + "..."
+            label = "User" if role == "user" else "Assistant"
+            parts.append(f"[{label}]: {text}")
+
+    parts.append(
+        "\nPlease continue from where we left off. "
+        "Ask me to clarify if you need more context."
+    )
+    return "\n\n".join(parts)
+
+
 def resume_session(filepath):
     """Resume a Cursor CLI agent session. Replaces the current process."""
     filepath_str = str(filepath)
-    session_id = Path(filepath_str).stem
-    # Defensive fallback: extract canonical UUID from path if stem is malformed.
-    if len(session_id) != 36:
-        m = re.search(
-            r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
-            filepath_str,
-            re.IGNORECASE,
+    filepath_obj = Path(filepath_str)
+
+    if filepath_obj.name == "store.db":
+        store_record = _cursor_store_record(filepath_obj)
+        if not store_record:
+            print(f"{YELLOW}[cursearch] Could not read Cursor chat store metadata.{RESET}", file=sys.stderr)
+            return
+        session_id = store_record["session_id"]
+        resume_messages = parse_session_messages(filepath_obj)
+        resume_cwd = extract_workspace_path(resume_messages) or store_record["workspace_path"]
+    else:
+        session_id = filepath_obj.stem
+        if len(session_id) != 36:
+            m = re.search(
+                r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+                filepath_str,
+                re.IGNORECASE,
+            )
+            if m:
+                session_id = m.group(1)
+        project_dirname = filepath_obj.parent.parent.name
+        resume_cwd = decode_project_path(project_dirname)
+
+    if not resume_cwd:
+        print(
+            f"{YELLOW}[cursearch] Could not infer a workspace path for {session_id}.{RESET}",
+            file=sys.stderr,
         )
-        if m:
-            session_id = m.group(1)
-    project_dirname = Path(filepath).parent.parent.name
-    project_path = decode_project_path(project_dirname)
-    # Bulletproof default: use workspace encoded by transcript container dir.
-    # Heuristic subdir inference can point at the wrong workspace and cause
-    # "resume" to start a new empty session context.
-    resume_cwd = project_path
-    cmd = ["agent", "--resume", session_id, "--workspace", resume_cwd]
-    print(f"[cursearch] project {project_path}", file=sys.stderr)
-    print(f"[cursearch] cd {resume_cwd}", file=sys.stderr)
-    print(f"[cursearch] session_id {session_id} (len={len(session_id)})", file=sys.stderr)
-    print(f"[cursearch] {' '.join(cmd)}", file=sys.stderr)
+        return
+
+    if _session_is_resumable(session_id, resume_cwd):
+        cmd = ["agent", "--resume", session_id, "--workspace", resume_cwd]
+        print(f"[cursearch] resuming {session_id}", file=sys.stderr)
+        print(f"[cursearch] {' '.join(cmd)}", file=sys.stderr)
+        os.chdir(resume_cwd)
+        os.execvp("agent", cmd)
+
+    # Fallback: blob store is empty, start a new session with context
+    print(
+        f"{YELLOW}[cursearch] Session blob store is empty — "
+        f"starting new session with prior context.{RESET}",
+        file=sys.stderr,
+    )
+    prompt = _build_continuation_prompt(filepath_str)
+    if prompt:
+        cmd = ["agent", "--workspace", resume_cwd, prompt]
+    else:
+        cmd = ["agent", "--workspace", resume_cwd]
     os.chdir(resume_cwd)
     os.execvp("agent", cmd)
 
@@ -1169,11 +1732,16 @@ def summarize_sessions(filepaths):
         fp = fp.strip()
         if not fp:
             continue
-        messages = parse_transcript(fp)
+        messages = parse_session_messages(fp)
         if not messages:
             continue
-        project_dir = Path(fp).parent.parent.name
-        project = short_project_name(project_dir)
+        fp_obj = Path(fp)
+        if fp_obj.name == "store.db":
+            store_record = _cursor_store_record(fp_obj)
+            project = store_record["project"] if store_record else "cursor-store"
+        else:
+            project_dir = fp_obj.parent.parent.name
+            project = short_project_name(project_dir)
         _, modified = get_file_times(fp)
         lines = [f"=== {project} ({modified.strftime('%Y-%m-%d')}) ==="]
         budget = 6000
@@ -1473,13 +2041,19 @@ def run_fzf(search_lines):
 
 def emit_lines(scope, sort_by="modified", query=""):
     """Print fzf lines to stdout (null-delimited) — used by fzf reload."""
-    sessions = scan_all_transcripts()
+    conn = open_search_cache()
+    sessions = _load_any_session_catalog(conn) or []
+    conn.close()
     lines = build_search_lines(sessions, scope=scope, sort_by=sort_by, query=query)
     sys.stdout.write(join_lines(lines))
     sys.stdout.flush()
 
 
 def main():
+    if sys.argv[1:2] == [SESSION_CATALOG_REFRESH_FLAG]:
+        scan_all_transcripts()
+        return
+
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
         reverse = "--reverse" in sys.argv[3:]
         latest_match = "--latest-match" in sys.argv[3:]
@@ -1527,15 +2101,22 @@ def main():
         emit_lines(sys.argv[2], sort_by=sort_by, query=query)
         return
 
-    print("Scanning Cursor agent transcripts...", file=sys.stderr)
-    sessions = scan_all_transcripts()
-    print(f"Found {len(sessions)} sessions.", file=sys.stderr)
+    conn = open_search_cache()
+    fingerprint = _session_discovery_fingerprint()
+    sessions = _load_session_catalog(conn, fingerprint)
+    needs_refresh = sessions is None
+    if sessions is None:
+        sessions = _load_any_session_catalog(conn)
+    conn.close()
+    if sessions is None:
+        sessions = []
+    if needs_refresh or not sessions:
+        _spawn_catalog_refresh()
+    print(f"Loaded {len(sessions)} cached sessions.", file=sys.stderr)
 
     if not sessions:
-        print("No transcripts found.", file=sys.stderr)
-        return
+        print("No cached transcripts yet; refreshing in background.", file=sys.stderr)
 
-    print("Building search index...", file=sys.stderr)
     lines = build_search_lines(sessions, scope="all", sort_by="modified", query="")
 
     action, selected = run_fzf(lines)
