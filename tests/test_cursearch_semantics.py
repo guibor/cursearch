@@ -87,6 +87,58 @@ class TestFullSearchIndexing(unittest.TestCase):
             self.ns["ordered_tokens_match"](record["searchable_all"], "tail_marker_query")
         )
 
+    def test_build_session_search_record_indexes_written_document(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            doc_path = Path(tmpdir) / "ea_notes.org"
+            doc_path.write_text(
+                "* EA\nThis session discussed Emergency Assist and the rollout plan.\n",
+                encoding="utf-8",
+            )
+            transcript_path = Path(tmpdir) / "session.jsonl"
+            transcript_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "role": "assistant",
+                                "message": {
+                                    "content": [
+                                        {
+                                            "type": "tool_use",
+                                            "name": "ApplyPatch",
+                                            "input": "*** Add File: "
+                                            + str(doc_path)
+                                            + "\n+* EA\n+This session discussed Emergency Assist and the rollout plan.\n",
+                                        }
+                                    ],
+                                },
+                            }
+                        )
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            record = self.ns["build_session_search_record"](transcript_path)
+            self.assertIn(str(doc_path), record["searchable_documents"])
+            self.assertIn("Emergency Assist", record["searchable_documents"])
+            self.assertIn("ea_notes.org", record["written_document_names"])
+
+            sessions = [record | {
+                "project": "demo",
+                "filepath": str(transcript_path),
+                "session_id": "session",
+                "created": self.ns["datetime"].fromtimestamp(1000),
+                "modified": self.ns["datetime"].fromtimestamp(2000),
+                "format": ".jsonl",
+            }]
+            lines = self.ns["build_search_lines"](sessions, query="Emergency Assist", scope="all")
+            self.assertEqual(len(lines), 1)
+            self.assertIn("ea_notes.org", lines[0])
+            self.assertIn("Emergency", lines[0])
+            self.assertIn("Assist", lines[0])
+
     def test_make_search_excerpt_centers_near_match(self):
         excerpt = self.ns["make_search_excerpt"](
             "alpha beta gamma delta epsilon zeta eta theta",
@@ -101,9 +153,17 @@ class TestFullSearchIndexing(unittest.TestCase):
         both = scorer("tsr tickets discussed here", "tsr tickets", tokens)
         one = scorer("tsr only", "tsr tickets", tokens)
         none = scorer("nothing useful", "tsr tickets", tokens)
-        self.assertGreater(both, one)
-        self.assertGreater(one, none)
+        self.assertGreater(both, none)
+        self.assertEqual(one, 0)
         self.assertEqual(none, 0)
+
+    def test_multi_word_query_requires_all_tokens(self):
+        scorer = self.ns["_score_query_text"]
+        tokens = self.ns["parse_query_tokens"]("403 Stuttgart")
+        full = scorer("403 error in Stuttgart coverage session", "403 Stuttgart", tokens)
+        partial = scorer("403 error session", "403 Stuttgart", tokens)
+        self.assertGreater(full, 0)
+        self.assertEqual(partial, 0)
 
     def test_preview_session_handles_empty_selection(self):
         with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
@@ -205,6 +265,11 @@ class TestFullSearchIndexing(unittest.TestCase):
 
     def test_session_catalog_cache_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = Path(tmpdir) / "demo.jsonl"
+            transcript.write_text(
+                '{"role":"user","message":{"content":[{"type":"text","text":"hello world tsr tickets"}]}}\n',
+                encoding="utf-8",
+            )
             db_path = Path(tmpdir) / "cache.sqlite3"
             old_db = self.ns["SEARCH_CACHE_DB"]
             self.ns["SEARCH_CACHE_DB"] = db_path
@@ -212,7 +277,7 @@ class TestFullSearchIndexing(unittest.TestCase):
                 conn = self.ns["open_search_cache"]()
                 record = {
                     "project": "demo",
-                    "filepath": "/tmp/demo.jsonl",
+                    "filepath": str(transcript),
                     "session_id": "abcd",
                     "created": self.ns["datetime"].fromtimestamp(1000),
                     "modified": self.ns["datetime"].fromtimestamp(2000),
@@ -238,24 +303,132 @@ class TestFullSearchIndexing(unittest.TestCase):
                 self.ns["SEARCH_CACHE_DB"] = old_db
 
     def test_build_search_lines_uses_cached_session_text(self):
-        sessions = [
-            {
-                "project": "demo",
-                "filepath": "/tmp/demo.jsonl",
-                "session_id": "abcd",
-                "created": self.ns["datetime"].fromtimestamp(1000),
-                "modified": self.ns["datetime"].fromtimestamp(2000),
-                "format": ".jsonl",
-                "source": "transcript",
-                "workspace_path": "/Users/md/code/demo",
-                "msg_count": 2,
-                "summary": "hello world",
-                "searchable_all": "hello world tsr tickets",
-                "searchable_user": "tsr tickets",
-                "searchable_assistant": "hello world",
-            }
-        ]
-        lines = self.ns["build_search_lines"](sessions, query="tsr tickets")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty_chats_dir = Path(tmpdir) / "cursor" / "chats"
+            empty_chats_dir.mkdir(parents=True)
+            transcript = Path(tmpdir) / "demo.jsonl"
+            transcript.write_text(
+                '{"role":"user","message":{"content":[{"type":"text","text":"hello world tsr tickets"}]}}\n',
+                encoding="utf-8",
+            )
+            old_dir = self.ns["CURSOR_CLI_CHATS_DIR"]
+            self.ns["CURSOR_CLI_CHATS_DIR"] = empty_chats_dir
+            try:
+                sessions = [
+                    {
+                        "project": "demo",
+                        "filepath": str(transcript),
+                        "session_id": "abcd",
+                        "created": self.ns["datetime"].fromtimestamp(1000),
+                        "modified": self.ns["datetime"].fromtimestamp(2000),
+                        "format": ".jsonl",
+                        "source": "transcript",
+                        "workspace_path": "/Users/md/code/demo",
+                        "msg_count": 2,
+                        "summary": "hello world",
+                        "searchable_all": "hello world tsr tickets",
+                        "searchable_user": "tsr tickets",
+                        "searchable_assistant": "hello world",
+                    }
+                ]
+                lines = self.ns["build_search_lines"](sessions, query="tsr tickets")
+            finally:
+                self.ns["CURSOR_CLI_CHATS_DIR"] = old_dir
         self.assertEqual(len(lines), 1)
         self.assertIn("tsr", lines[0].lower())
+
+    def test_search_skips_missing_cached_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            existing = Path(tmpdir) / "existing.jsonl"
+            existing.write_text(
+                '{"role":"user","message":{"content":[{"type":"text","text":"403 error"}]}}\n',
+                encoding="utf-8",
+            )
+            missing = Path(tmpdir) / "missing.jsonl"
+            sessions = [
+                {
+                    "project": "demo",
+                    "filepath": str(missing),
+                    "session_id": "missing",
+                    "created": self.ns["datetime"].fromtimestamp(1000),
+                    "modified": self.ns["datetime"].fromtimestamp(2000),
+                    "format": ".jsonl",
+                    "source": "transcript",
+                    "workspace_path": "/Users/md/code/demo",
+                    "msg_count": 0,
+                    "summary": "",
+                    "searchable_all": "",
+                    "searchable_user": "",
+                    "searchable_assistant": "",
+                },
+                {
+                    "project": "demo",
+                    "filepath": str(existing),
+                    "session_id": "existing",
+                    "created": self.ns["datetime"].fromtimestamp(1000),
+                    "modified": self.ns["datetime"].fromtimestamp(2000),
+                    "format": ".jsonl",
+                    "source": "transcript",
+                    "workspace_path": "/Users/md/code/demo",
+                    "msg_count": 0,
+                    "summary": "",
+                    "searchable_all": "",
+                    "searchable_user": "",
+                    "searchable_assistant": "",
+                },
+            ]
+            scores = self.ns["search_sessions"](sessions, "403", "all")
+            self.assertIn(str(existing), scores)
+            self.assertNotIn(str(missing), scores)
+
+    def test_build_search_lines_includes_hidden_store_results_with_visible_hits(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            visible_path = Path(tmpdir) / "visible.jsonl"
+            store_path = Path(tmpdir) / "store.db"
+            visible_path.write_text(
+                '{"role":"user","message":{"content":[{"type":"text","text":"403 only"}]}}\n',
+                encoding="utf-8",
+            )
+            store_path.write_text(
+                '{"role":"user","message":{"content":[{"type":"text","text":"403 and Stuttgart session"}]}}\n',
+                encoding="utf-8",
+            )
+
+            sessions = [
+                {
+                    "project": "demo",
+                    "filepath": str(visible_path),
+                    "session_id": "visible",
+                    "created": self.ns["datetime"].fromtimestamp(1000),
+                    "modified": self.ns["datetime"].fromtimestamp(2000),
+                    "format": ".jsonl",
+                    "source": "transcript",
+                    "workspace_path": "/Users/md/code/demo",
+                    "msg_count": 1,
+                    "summary": "403 only",
+                    "searchable_all": "403 only",
+                    "searchable_user": "403 only",
+                    "searchable_assistant": "",
+                },
+                {
+                    "project": "demo",
+                    "filepath": str(store_path),
+                    "session_id": "store",
+                    "created": self.ns["datetime"].fromtimestamp(1000),
+                    "modified": self.ns["datetime"].fromtimestamp(3000),
+                    "format": ".store.db",
+                    "source": "cursor_store",
+                    "workspace_path": "/Users/md/code/demo",
+                    "msg_count": 1,
+                    "summary": "403 and Stuttgart",
+                    "searchable_all": "403 and Stuttgart session",
+                    "searchable_user": "403 and Stuttgart session",
+                    "searchable_assistant": "",
+                },
+            ]
+
+            lines = self.ns["build_search_lines"](sessions, query="403 Stuttgart", scope="all")
+            rendered = "\n".join(lines)
+            self.assertNotIn("visible.jsonl", rendered)
+            self.assertIn("store.db", rendered)
 

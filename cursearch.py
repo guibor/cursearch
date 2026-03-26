@@ -26,8 +26,10 @@ HOME_PREFIX = str(Path.home()).lstrip("/").replace("/", "-") + "-"
 MAX_SUMMARY_QUERIES = 5
 SEARCH_CACHE_DB = Path(tempfile.gettempdir()) / "cursearch_search_cache.sqlite3"
 SEARCH_EXCERPT_CHARS = 180
-SESSION_CATALOG_FINGERPRINT_KEY = "session_catalog_fingerprint_v3"
+SESSION_CATALOG_FINGERPRINT_KEY = "session_catalog_fingerprint_v5"
 SESSION_CATALOG_REFRESH_FLAG = "--refresh-cache"
+DOCUMENT_EXTENSIONS = {".org", ".md", ".markdown", ".html", ".htm", ".txt", ".rst"}
+WRITE_TOOL_NAMES = {"ApplyPatch", "StrReplace", "EditNotebook", "Edit", "Write", "WriteFile"}
 
 # * ANSI colors
 
@@ -185,6 +187,126 @@ def extract_workspace_path(messages):
     return None
 
 
+DOC_PATH_RE = re.compile(
+    r"(?P<path>(?:[A-Za-z]:)?(?:/|\.{1,2}/)[^\s\"'`<>|]+?\.(?:org|md|markdown|html|htm|txt|rst))"
+)
+
+
+def _normalize_document_path(raw_path):
+    """Normalize a candidate document path from a tool invocation."""
+    if not raw_path:
+        return None
+    candidate = Path(str(raw_path).strip().strip("`\"'"))
+    if candidate.suffix.lower() not in DOCUMENT_EXTENSIONS:
+        return None
+    return str(candidate)
+
+
+def _extract_doc_paths_from_text(text):
+    """Extract candidate document paths from a blob of tool input text."""
+    if not text:
+        return []
+    paths = []
+    for match in DOC_PATH_RE.finditer(str(text)):
+        path = _normalize_document_path(match.group("path"))
+        if path:
+            paths.append(path)
+    return paths
+
+
+@lru_cache(maxsize=None)
+def _extract_written_document_paths(filepath):
+    """Find documents that the session likely wrote or modified."""
+    filepath = Path(filepath)
+    if filepath.suffix != ".jsonl" or not filepath.exists():
+        return tuple()
+
+    paths = []
+    seen = set()
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = obj.get("message", {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "tool_use":
+                    continue
+                tool_name = part.get("name", "")
+                if tool_name not in WRITE_TOOL_NAMES and tool_name != "Shell":
+                    continue
+                tool_input = part.get("input")
+                candidate_texts = []
+                if isinstance(tool_input, str):
+                    candidate_texts.append(tool_input)
+                elif isinstance(tool_input, dict):
+                    for key in (
+                        "path",
+                        "file_path",
+                        "filepath",
+                        "target_notebook",
+                        "target_path",
+                        "document_path",
+                        "command",
+                    ):
+                        value = tool_input.get(key)
+                        if isinstance(value, str):
+                            candidate_texts.append(value)
+                    try:
+                        candidate_texts.append(
+                            json.dumps(tool_input, ensure_ascii=False, sort_keys=True)
+                        )
+                    except TypeError:
+                        candidate_texts.append(str(tool_input))
+                for blob in candidate_texts:
+                    for path in _extract_doc_paths_from_text(blob):
+                        if path not in seen:
+                            seen.add(path)
+                            paths.append(path)
+    return tuple(paths)
+
+
+@lru_cache(maxsize=None)
+def _read_document_search_text(filepath):
+    """Read a document as searchable text, with light HTML stripping."""
+    path = Path(filepath)
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if path.suffix.lower() in {".html", ".htm"}:
+        text = re.sub(r"<script.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html_mod.unescape(text)
+    return text.strip()
+
+
+def build_written_document_search_record(filepath):
+    """Build searchable text for documents written by a session."""
+    written_documents = list(_extract_written_document_paths(filepath))
+    written_document_names = [Path(p).name for p in written_documents]
+    searchable_documents_parts = []
+    for doc_path in written_documents:
+        searchable_documents_parts.append(doc_path)
+        doc_text = _read_document_search_text(doc_path)
+        if doc_text:
+            searchable_documents_parts.append(doc_text)
+    return {
+        "searchable_documents": "\n".join(searchable_documents_parts),
+        "written_documents": written_documents,
+        "written_document_names": written_document_names,
+    }
+
+
 # * XML/tag stripping
 
 NOISE_TAGS_RE = re.compile(
@@ -271,9 +393,10 @@ def _cursor_store_record(store_db):
 
 
 def _session_discovery_fingerprint():
-    """Fingerprint the visible Cursor session sources for cache invalidation."""
+    """Fingerprint the visible and hidden Cursor session sources."""
     payload = {
         "projects": [],
+        "cursor_stores": [],
     }
 
     if CURSOR_PROJECTS_DIR.is_dir():
@@ -284,6 +407,15 @@ def _session_discovery_fingerprint():
             stat = transcripts_dir.stat()
             payload["projects"].append(
                 [project_dir.name, stat.st_mtime_ns, stat.st_size]
+            )
+
+    if CURSOR_CLI_CHATS_DIR.is_dir():
+        for workspace_dir in sorted(CURSOR_CLI_CHATS_DIR.iterdir()):
+            if not workspace_dir.is_dir():
+                continue
+            stat = workspace_dir.stat()
+            payload["cursor_stores"].append(
+                [workspace_dir.name, stat.st_mtime_ns, stat.st_size]
             )
 
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -312,6 +444,14 @@ def _record_from_cache(cached):
     return record
 
 
+def _session_file_exists(filepath):
+    """Return True when a session file still exists on disk."""
+    try:
+        return Path(filepath).exists()
+    except OSError:
+        return False
+
+
 def _load_session_catalog(conn, fingerprint):
     """Load the cached session catalog if the fingerprint matches."""
     row = conn.execute(
@@ -324,7 +464,12 @@ def _load_session_catalog(conn, fingerprint):
     rows = conn.execute(
         "SELECT record_json FROM session_catalog ORDER BY modified_ts DESC, filepath ASC"
     ).fetchall()
-    return [_record_from_cache(json.loads(row["record_json"])) for row in rows]
+    sessions = []
+    for row in rows:
+        record = _record_from_cache(json.loads(row["record_json"]))
+        if _session_file_exists(record.get("filepath", "")):
+            sessions.append(record)
+    return sessions
 
 
 def _load_any_session_catalog(conn):
@@ -339,7 +484,12 @@ def _load_any_session_catalog(conn):
     ).fetchall()
     if not rows:
         return None
-    return [_record_from_cache(json.loads(row["record_json"])) for row in rows]
+    sessions = []
+    for row in rows:
+        record = _record_from_cache(json.loads(row["record_json"]))
+        if _session_file_exists(record.get("filepath", "")):
+            sessions.append(record)
+    return sessions or None
 
 
 def _save_session_catalog(conn, fingerprint, sessions):
@@ -399,6 +549,7 @@ def _scan_project_transcripts(project_dir):
             continue
 
         created, modified = get_file_times(fpath)
+        search_record = build_session_search_record(fpath)
         seen_ids.add(session_id)
         sessions.append(
             {
@@ -409,28 +560,30 @@ def _scan_project_transcripts(project_dir):
                 "modified": modified,
                 "format": fpath.suffix,
                 "source": "transcript",
-                "workspace_path": workspace_path,
-                "msg_count": 0,
-                "summary": "",
-                "searchable_all": "",
-                "searchable_user": "",
-                "searchable_assistant": "",
+                "workspace_path": search_record.get("workspace_path", workspace_path),
+                "msg_count": search_record["msg_count"],
+                "summary": search_record["summary"],
+                "searchable_all": search_record["searchable_all"],
+                "searchable_user": search_record["searchable_user"],
+                "searchable_assistant": search_record["searchable_assistant"],
             }
         )
 
     return sessions
 
 
-def scan_all_transcripts():
-    """Walk all Cursor session sources and collect transcript metadata."""
+def scan_all_transcripts(force_refresh=False):
+    """Walk all Cursor session sources and collect searchable session data."""
     conn = open_search_cache()
+    if not force_refresh:
+        fingerprint = _session_discovery_fingerprint()
+        cached = _load_session_catalog(conn, fingerprint)
+        if cached is None:
+            cached = _load_any_session_catalog(conn)
+        if cached is not None:
+            conn.close()
+            return cached
     fingerprint = _session_discovery_fingerprint()
-    cached = _load_session_catalog(conn, fingerprint)
-    if cached is None:
-        cached = _load_any_session_catalog(conn)
-    if cached is not None:
-        conn.close()
-        return cached
 
     sessions = []
 
@@ -444,6 +597,8 @@ def scan_all_transcripts():
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for chunk in pool.map(_scan_project_transcripts, project_dirs):
                 sessions.extend(chunk)
+
+    sessions.extend(_scan_cursor_store_sessions())
 
     sessions.sort(key=lambda s: s["modified"], reverse=True)
     _save_session_catalog(conn, fingerprint, sessions)
@@ -641,12 +796,16 @@ def build_session_search_record(filepath):
     searchable_assistant = " ".join(
         t.replace("\n", " ") for r, t in cleaned_messages if r == "assistant"
     )
+    doc_record = build_written_document_search_record(filepath)
     return {
         "msg_count": len(cleaned_messages),
         "summary": make_summary(cleaned_messages),
         "searchable_all": searchable_all,
         "searchable_user": searchable_user,
         "searchable_assistant": searchable_assistant,
+        "searchable_documents": doc_record["searchable_documents"],
+        "written_documents": doc_record["written_documents"],
+        "written_document_names": doc_record["written_document_names"],
         "workspace_path": workspace_path or "",
         "source": "cursor_store" if Path(filepath).name == "store.db" else "transcript",
     }
@@ -776,6 +935,9 @@ def _score_query_text(text, query, tokens):
     if normalized_query and normalized_query in haystack.lower():
         score += 500
 
+    if len(tokens) > 1 and not ordered_tokens_match(haystack, query):
+        return 0
+
     matched_tokens = 0
     for token in tokens:
         if token_contains(haystack, token) >= 0:
@@ -802,24 +964,57 @@ def search_sessions(sessions, query, scope="all"):
         return None
 
     have_cached_searchables = any(
-        row.get("searchable_all") or row.get("searchable_user") or row.get("searchable_assistant")
+        row.get("searchable_all")
+        or row.get("searchable_user")
+        or row.get("searchable_assistant")
+        or row.get("searchable_documents")
         for row in sessions
     )
     scores = {}
     col = _fts_scope_column(scope)
+    missing_document_rows = []
     if have_cached_searchables:
         for row in sessions:
+            if not _session_file_exists(row.get("filepath", "")):
+                continue
             searchable = f"{row.get('summary', '')}\n{row.get(col, '')}"
+            if scope == "all":
+                doc_text = row.get("searchable_documents", "")
+                searchable = f"{searchable}\n{doc_text}"
+                if not doc_text:
+                    missing_document_rows.append(row)
             score = _score_query_text(searchable, query, tokens)
             if score > 0:
                 scores[row["filepath"]] = score
     else:
         for row in sessions:
-            record = build_session_search_record(row["filepath"])
+            filepath = row.get("filepath", "")
+            if not _session_file_exists(filepath):
+                continue
+            record = build_session_search_record(filepath)
             searchable = f"{record.get('summary', '')}\n{record.get(col, '')}"
+            if scope == "all":
+                searchable = f"{searchable}\n{record.get('searchable_documents', '')}"
             score = _score_query_text(searchable, query, tokens)
             if score > 0:
-                scores[row["filepath"]] = score
+                scores[filepath] = score
+
+    if scope == "all" and missing_document_rows:
+        for row in missing_document_rows:
+            filepath = row.get("filepath", "")
+            if not _session_file_exists(filepath):
+                continue
+            doc_record = build_written_document_search_record(filepath)
+            doc_text = doc_record.get("searchable_documents", "")
+            if not doc_text:
+                continue
+            row.setdefault("searchable_documents", doc_text)
+            row.setdefault("written_documents", doc_record.get("written_documents", []))
+            row.setdefault("written_document_names", doc_record.get("written_document_names", []))
+            searchable = f"{row.get('summary', '')}\n{row.get(col, '')}\n{doc_text}"
+            score = _score_query_text(searchable, query, tokens)
+            if score > scores.get(filepath, 0):
+                scores[filepath] = score
     return scores
 
 
@@ -827,8 +1022,11 @@ def get_searchable_text(sessions, filepath, scope="all"):
     """Retrieve the cached searchable text for a session."""
     col = _fts_scope_column(scope)
     for row in sessions:
-        if row["filepath"] == filepath:
-            return row.get(col, "")
+        if row["filepath"] == filepath and _session_file_exists(filepath):
+            text = row.get(col, "")
+            if scope == "all":
+                text = f"{text}\n{row.get('searchable_documents', '')}"
+            return text
     return ""
 
 
@@ -876,13 +1074,6 @@ def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
         ordered_sessions = sorted(sessions, key=lambda s: s["modified"], reverse=True)
 
     matching_scores = search_sessions(ordered_sessions, query, scope) if query.strip() else None
-    if query.strip() and not matching_scores:
-        store_sessions = _scan_cursor_store_sessions()
-        if store_sessions:
-            store_scores = search_sessions(store_sessions, query, scope)
-            if store_scores:
-                ordered_sessions = ordered_sessions + store_sessions
-                matching_scores = store_scores
 
     ranked_sessions = []
     for s in ordered_sessions:
@@ -912,7 +1103,10 @@ def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
         workspace_path = s.get("workspace_path", "")
 
         searchable = s.get(_fts_scope_column(scope), "")
+        if scope == "all":
+            searchable = f"{searchable}\n{s.get('searchable_documents', '')}"
         excerpt = make_search_excerpt(f"{summary}\n{searchable}", query) if query.strip() else ""
+        doc_names = ", ".join(s.get("written_document_names", [])[:3])
 
         hl_project = highlight_matches(s['project'], query, CYAN + BOLD) if query else s['project']
         hl_summary = highlight_matches(summary, query, DIM) if query else summary
@@ -920,6 +1114,7 @@ def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
 
         score_str = f" {GRAY}[{score}]{RESET}" if query else ""
         excerpt_line = f"\n  {GRAY}{DIM}{hl_excerpt}{RESET}" if excerpt else ""
+        docs_line = f"\n  {GRAY}docs{RESET} {DIM}{doc_names}{RESET}" if doc_names else ""
         card = (
             f"{CYAN}{BOLD}{hl_project}{RESET}"
             f"{score_str}"
@@ -927,6 +1122,7 @@ def build_search_lines(sessions, scope="all", sort_by="modified", query=""):
             f"  {DIM}{modified_str}{RESET}"
             f"  {GRAY}cre {created_str}{RESET}\n"
             f"  {DIM}{hl_summary}{RESET}"
+            f"{docs_line}"
             f"{excerpt_line}"
         )
 
@@ -2051,7 +2247,7 @@ def emit_lines(scope, sort_by="modified", query=""):
 
 def main():
     if sys.argv[1:2] == [SESSION_CATALOG_REFRESH_FLAG]:
-        scan_all_transcripts()
+        scan_all_transcripts(force_refresh=True)
         return
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
